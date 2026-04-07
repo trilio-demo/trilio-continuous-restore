@@ -1,0 +1,20 @@
+# Default values for Trilio chart
+trilio:
+  channel: "5.3.x"
+  instanceName: "{{ .Values.global.localClusterName }}"
+  namespace: trilio-system
+  # licenseSecretRef controls the License CR format:
+  #   false (default) — 5.2.x format: spec.key (inline key from Secret)
+  #   true            — 5.3.x format: spec.secretRef (Secret name/namespace)
+  # Set to true in values overrides when spoke is running 5.3.x.
+  licenseSecretRef: false
+
+# BackupTarget: S3-compatible object store for Trilio backups.
+# Credentials (accessKey, secretKey) are pulled from Vault via ESO:
+#   secret/global/trilio-s3  { accessKey: "...", secretKey: "..." }
+# Override bucketName and region in values-hub.yaml / values-secondary.yaml
+# or via helmOverrides in the application entry.
+backupTarget:
+  bucketName: ""
+  region: ca-central-1
+  enableBrowsing: true

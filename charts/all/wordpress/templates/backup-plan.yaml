@@ -1,0 +1,30 @@
+apiVersion: triliovault.trilio.io/v1
+kind: BackupPlan
+metadata:
+  name: wordpress-backup-plan
+  namespace: wordpress
+spec:
+  backupConfig:
+    target:
+      apiVersion: triliovault.trilio.io/v1
+      kind: Target
+      name: trilio-s3-target
+      namespace: trilio-system
+  backupPlanComponents: {}
+  hookConfig:
+    hooks:
+      - hook:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Hook
+          name: wordpress-mysql-hook
+          namespace: wordpress
+        podSelector:
+          regex: wordpress-mysql*
+    mode: Sequential
+    podReadyWaitSeconds: 120
+  snapshotConfig:
+    target:
+      apiVersion: triliovault.trilio.io/v1
+      kind: Target
+      name: trilio-s3-target
+      namespace: trilio-system

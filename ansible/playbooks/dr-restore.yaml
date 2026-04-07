@@ -1,0 +1,576 @@
+---
+# dr-restore.yaml
+#
+# Triggers a Trilio Restore operation using one of three methods, polls until
+# Completed, and optionally validates that restored application pods are Running.
+#
+# Three restore methods (set via restore_method variable):
+#
+#   backup       - Restore from a named Backup CR.  If source_backup is omitted,
+#                  auto-discovers the latest Available backup in restore_namespace.
+#                  Use for standard DR failover from a point-in-time backup.
+#
+#   location     - Restore by browsing the BackupTarget storage directly.
+#                  Use when the Backup CR is absent on this cluster (e.g. the
+#                  cluster that created the backup is gone) but the data still
+#                  exists in object storage.
+#
+#   consistentset - Restore from a ConsistentSet CR pre-staged on the DR cluster
+#                   by Trilio Continuous Restore.  This is the PRIMARY method for
+#                   the Validated Pattern DR failover — Trilio continuously stages
+#                   a ready-to-use consistent snapshot on the DR cluster so failover
+#                   requires no on-demand backup step.
+#                   NOTE: ConsistentSet restores require a post-restore URL rewrite
+#                   step.  This playbook applies it directly via database exec after
+#                   the restore completes (see section 10 below).
+#
+# Trilio CRs involved:
+#   Restore          - references the backup source and drives the restore
+#   Hook (optional)  - post-restore hook (managed by ArgoCD) that rewrites
+#                      WordPress URLs in MySQL wp_options after restore
+#
+# Usage:
+#   # Method 1a — named backup
+#   ansible-playbook ansible/playbooks/dr-restore.yaml \
+#     -e restore_method=backup \
+#     -e source_backup=wordpress-backup-20260305-14h25 \
+#     -e restore_namespace=wordpress
+#
+#   # Method 1b — auto-discover latest backup
+#   ansible-playbook ansible/playbooks/dr-restore.yaml \
+#     -e restore_method=backup \
+#     -e restore_namespace=wordpress
+#
+#   # Method 2a — location browse, path auto-extracted from a named Backup CR
+#   #   Backup CR status.location = <backupplan-uid>/<backup-uid>
+#   #   CLI: kubectl get backup <name> -n wordpress -o jsonpath='{.status.location}'
+#   ansible-playbook ansible/playbooks/dr-restore.yaml \
+#     -e restore_method=location \
+#     -e source_backup=wordpress-backup-20260305-15h04 \
+#     -e restore_namespace=wordpress
+#
+#   # Method 2b — location browse, path supplied manually (when Backup CR is gone)
+#   ansible-playbook ansible/playbooks/dr-restore.yaml \
+#     -e restore_method=location \
+#     -e "backup_location_path=<backupplan-uid>/<backup-uid>" \
+#     -e restore_namespace=wordpress
+#
+#   # Method 3 — consistent set (DR cluster)
+#   ansible-playbook ansible/playbooks/dr-restore.yaml \
+#     -e restore_method=consistentset \
+#     -e consistent_set_name=wordpress-consistent-set \
+#     -e restore_namespace=wordpress
+#
+# Required variables (all methods):
+#   restore_namespace:    namespace where restore resources will land
+#
+# Method-specific required variables:
+#   backup method:        source_backup (optional — auto-discovers latest if omitted)
+#   location method:      source_backup OR backup_location_path
+#                           source_backup        → path auto-extracted from status.location
+#                           backup_location_path → path supplied manually (Backup CR gone)
+#                         Target CR always looked up from trilio_namespace (trilio-system).
+#   consistentset method: consistent_set_name
+#
+# Optional variables:
+#   restore_method:       backup | location | consistentset  (default: backup)
+#   restore_name:         name for the Restore CR
+#                         (default: <method>-restore-<timestamp>)
+#   backup_target_name:   name of the Target CR (default: trilio-s3-target)
+#   trilio_namespace:     namespace where Trilio is installed (default: trilio-system)
+#   backup_namespace:     namespace where Backup CRs live (default: restore_namespace)
+#   timeout_seconds:      polling timeout in seconds (default: 1800)
+#   validate_pods:        if true, check restored pods come up Running (default: true)
+#
+# Hook + Transform variables (WordPress DR):
+#   restore_hook_name:    name of the Hook CR pre-deployed in restore_namespace
+#                         (default: wordpress-restore-hook)
+#                         Used for backup/location methods only.
+#                         For consistentset, URL rewrite is applied via direct
+#                         database exec (section 10) — no Hook CR required.
+#   cluster_domain:       (optional override) apps domain of the DR cluster.
+#                         If omitted, auto-discovered from the cluster:
+#                           oc get ingresses.config cluster -o jsonpath='{.spec.domain}'
+#                           → apps.ocp-dc6.demo.presales.trilio.io
+#                         Route hostname is built as:
+#                           {{ restore_namespace }}.{{ ingress_domain }}
+#                         Set explicitly only if auto-discovery is unavailable.
+
+- name: Trigger Trilio DR restore
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    restore_method: backup
+    restore_name: "{{ restore_method }}-restore-{{ lookup('pipe', 'date +%Y%m%d-%Hh%M') }}"
+    backup_target_name: trilio-s3-target
+    trilio_namespace: trilio-system
+    timeout_seconds: 1800
+    validate_pods: true
+    restore_hook_name: wordpress-restore-hook
+
+  pre_tasks:
+    - name: Assert required variables are set
+      ansible.builtin.assert:
+        that:
+          - restore_namespace is defined
+          - restore_method in ['backup', 'location', 'consistentset']
+        fail_msg: >
+          Required: restore_namespace.
+          restore_method must be backup | location | consistentset (got: {{ restore_method | default('undefined') }})
+
+    - name: Assert method-specific required variables
+      ansible.builtin.assert:
+        that: "{{ method_assertions[restore_method] }}"
+        fail_msg: "{{ method_fail_msgs[restore_method] }}"
+      vars:
+        method_assertions:
+          backup: "true"
+          location: "(source_backup is defined) or (backup_location_path is defined)"
+          consistentset: "consistent_set_name is defined"
+        method_fail_msgs:
+          backup: ""
+          location: "location method requires source_backup (auto-extracts path) or backup_location_path (manual)"
+          consistentset: "consistentset method requires: consistent_set_name"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Pre-flight: confirm Trilio is healthy
+    # -------------------------------------------------------------------------
+    - name: Confirm Trilio is healthy before attempting restore
+      ansible.builtin.include_tasks: _validate_trilio_ready.yaml
+
+    # -------------------------------------------------------------------------
+    # 2. Method: backup — resolve source backup name
+    #    If source_backup was not provided, list all Backups in restore_namespace
+    #    and select the most recently created Available one.
+    # -------------------------------------------------------------------------
+    - name: Resolve source backup (method=backup)
+      when: restore_method == 'backup' and source_backup is not defined
+      block:
+
+        - name: List all Backups in {{ restore_namespace | default(backup_namespace | default('wordpress')) }}
+          kubernetes.core.k8s_info:
+            api_version: triliovault.trilio.io/v1
+            kind: Backup
+            namespace: "{{ backup_namespace | default(restore_namespace) }}"
+          register: all_backups
+
+        - name: Assert at least one Available Backup exists
+          ansible.builtin.assert:
+            that:
+              - >
+                all_backups.resources
+                  | selectattr('status.status', 'equalto', 'Available')
+                  | list | length > 0
+            fail_msg: >
+              No Available Backup CRs found in
+              {{ backup_namespace | default(restore_namespace) }}.
+              Create a backup first or specify source_backup explicitly.
+
+        - name: Auto-select latest Available backup
+          ansible.builtin.set_fact:
+            source_backup: >-
+              {{ (all_backups.resources
+                   | selectattr('status.status', 'equalto', 'Available')
+                   | sort(attribute='metadata.creationTimestamp')
+                   | last).metadata.name }}
+
+        - name: Show auto-selected backup
+          ansible.builtin.debug:
+            msg: "Auto-selected latest Available backup: {{ source_backup }}"
+
+    # -------------------------------------------------------------------------
+    # 3. Method: backup — verify chosen Backup is Available
+    # -------------------------------------------------------------------------
+    - name: Verify source Backup is Available (method=backup)
+      when: restore_method == 'backup'
+      block:
+
+        - name: Get source Backup CR
+          kubernetes.core.k8s_info:
+            api_version: triliovault.trilio.io/v1
+            kind: Backup
+            name: "{{ source_backup }}"
+            namespace: "{{ backup_namespace | default(restore_namespace) }}"
+          register: backup_result
+          failed_when: >
+            backup_result.resources | length == 0 or
+            (backup_result.resources[0].status.status | default('')) != 'Available'
+
+        - name: Show source Backup details
+          ansible.builtin.debug:
+            msg: >
+              Source Backup: {{ source_backup }}
+              Status: {{ backup_result.resources[0].status.status }}
+              Created: {{ backup_result.resources[0].metadata.creationTimestamp }}
+              Size: {{ backup_result.resources[0].status.size | default('unknown') }}
+
+    # -------------------------------------------------------------------------
+    # 4. Method: location — resolve path and verify BackupTarget is Available
+    #
+    #    The Restore CR needs the S3 path of the backup, which Trilio stores in
+    #    status.location as "<backupplan-uid>/<backup-uid>".
+    #
+    #    Two ways to obtain it:
+    #      a) source_backup provided → fetch the Backup CR and read status.location
+    #      b) backup_location_path provided → use it directly (Backup CR may be gone)
+    #
+    #    The Target CR always lives in trilio_namespace (trilio-system).
+    # -------------------------------------------------------------------------
+    - name: Resolve location path and verify BackupTarget (method=location)
+      when: restore_method == 'location'
+      block:
+
+        - name: Fetch Backup CR to extract location path (method=location, source_backup given)
+          when: source_backup is defined
+          kubernetes.core.k8s_info:
+            api_version: triliovault.trilio.io/v1
+            kind: Backup
+            name: "{{ source_backup }}"
+            namespace: "{{ backup_namespace | default(restore_namespace) }}"
+          register: _loc_backup_result
+          failed_when: >
+            _loc_backup_result.resources | length == 0 or
+            (_loc_backup_result.resources[0].status.location | default('')) == ''
+
+        - name: Set backup_location_path from Backup CR status.location
+          when: source_backup is defined
+          ansible.builtin.set_fact:
+            backup_location_path: "{{ _loc_backup_result.resources[0].status.location }}"
+
+        - name: Show resolved location path
+          ansible.builtin.debug:
+            msg: "Location path: {{ backup_location_path }} (Target: {{ backup_target_name }} in {{ trilio_namespace }})"
+
+        - name: Get BackupTarget CR
+          kubernetes.core.k8s_info:
+            api_version: triliovault.trilio.io/v1
+            kind: Target
+            name: "{{ backup_target_name }}"
+            namespace: "{{ trilio_namespace }}"
+          register: target_result
+          failed_when: >
+            target_result.resources | length == 0 or
+            (target_result.resources[0].status.status | default('')) != 'Available'
+
+        - name: Show BackupTarget details
+          ansible.builtin.debug:
+            msg: >
+              BackupTarget: {{ backup_target_name }}
+              Status: {{ target_result.resources[0].status.status }}
+              Type: {{ target_result.resources[0].spec.type | default('unknown') }}
+
+    # -------------------------------------------------------------------------
+    # 5. Method: consistentset — verify ConsistentSet CR exists and is ready
+    #    The ConsistentSet is pre-staged on this DR cluster by Trilio Continuous
+    #    Restore.  We verify it is in a usable state before triggering restore.
+    # -------------------------------------------------------------------------
+    - name: Verify ConsistentSet (method=consistentset)
+      when: restore_method == 'consistentset'
+      block:
+
+        - name: Get ConsistentSet CR
+          kubernetes.core.k8s_info:
+            api_version: triliovault.trilio.io/v1
+            kind: ConsistentSet
+            name: "{{ consistent_set_name }}"
+          register: cset_result
+          failed_when: >
+            cset_result.resources | length == 0
+
+        - name: Show ConsistentSet details
+          ansible.builtin.debug:
+            msg: >
+              ConsistentSet: {{ consistent_set_name }}
+              Status: {{ cset_result.resources[0].status | default({}) | to_nice_json }}
+
+    # -------------------------------------------------------------------------
+    # 6. Pre-check: detect restore Hook CR in restore_namespace (optional)
+    #    The Hook CR runs post-restore to update MySQL wp_options siteurl/home
+    #    to the DR cluster URL.  It must be pre-deployed before restore starts.
+    #    If absent, the restore proceeds without hookConfig (demo-safe).
+    # -------------------------------------------------------------------------
+    - name: Check for restore Hook CR in {{ restore_namespace }}
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Hook
+        name: "{{ restore_hook_name }}"
+        namespace: "{{ restore_namespace }}"
+      register: hook_result
+
+    - name: Set hook_found fact
+      ansible.builtin.set_fact:
+        _hook_found: "{{ hook_result.resources | length > 0 }}"
+
+    - name: Show hook detection result
+      ansible.builtin.debug:
+        msg: >-
+          {% if restore_method == 'consistentset' %}
+          ConsistentSet restore: Hook CR support is a planned enhancement (see PRD Req 7a).
+          Post-restore URL rewrite is applied via direct database exec in section 10.
+          {% elif _hook_found %}
+          Restore Hook CR found: hookConfig will be included.
+          {% else %}
+          WARNING: Hook CR {{ restore_hook_name }} not found in {{ restore_namespace }}
+          — proceeding without hookConfig.  MySQL wp_options will NOT be updated post-restore.
+          {% endif %}
+
+    # -------------------------------------------------------------------------
+    # 7. Build Restore CR spec — source varies by method
+    #
+    #    backup:       source.type=Backup  — references Backup CR by name
+    #    location:     source.type=Location — path from status.location +
+    #                  inline target reference (namespace = restore_namespace,
+    #                  where Trilio copies the Target CR before restore)
+    #    consistentset: source.type=ConsistentSet — cluster-scoped CR
+    #
+    #    hookConfig:         references the pre-deployed Hook CR by name;
+    #                        targets wordpress-mysql pods; runs post-restore
+    #                        to update MySQL wp_options URLs.
+    #                        Applied for backup/location methods only.
+    #                        ConsistentSet hook support is a planned enhancement (Req 7a).
+    #
+    #    restoreFlags:       skipIfAlreadyExists prevents errors when restore
+    #                        namespace already has pre-existing resources.
+    #
+    #    transformComponents: rewrites Route /spec/host to the DR cluster URL.
+    #                        hostname = {{ restore_namespace }}.apps.{{ cluster_domain }}
+    #                        Only applied when cluster_domain is defined.
+    # -------------------------------------------------------------------------
+    - name: Build Restore source spec (method=backup)
+      when: restore_method == 'backup'
+      ansible.builtin.set_fact:
+        _restore_source:
+          type: Backup
+          backup:
+            name: "{{ source_backup }}"
+            namespace: "{{ backup_namespace | default(restore_namespace) }}"
+
+    - name: Build Restore source spec (method=location)
+      when: restore_method == 'location'
+      ansible.builtin.set_fact:
+        _restore_source:
+          type: Location
+          location: "{{ backup_location_path }}"
+          target:
+            apiVersion: triliovault.trilio.io/v1
+            kind: Target
+            name: "{{ backup_target_name }}"
+            namespace: "{{ trilio_namespace }}"
+
+    - name: Build Restore source spec (method=consistentset)
+      when: restore_method == 'consistentset'
+      ansible.builtin.set_fact:
+        _restore_source:
+          type: ConsistentSet
+          consistentSet:
+            name: "{{ consistent_set_name }}"
+
+    - name: Build base Restore CR spec
+      ansible.builtin.set_fact:
+        _restore_spec:
+          actionFlags: {}
+          restoreFlags:
+            skipIfAlreadyExists: true
+          source: "{{ _restore_source }}"
+
+    - name: Add hookConfig to Restore CR spec (Hook CR found, backup/location methods only)
+      when: _hook_found | bool and restore_method != 'consistentset'
+      ansible.builtin.set_fact:
+        _restore_spec: >-
+          {{ _restore_spec | combine({
+            'hookConfig': {
+              'hooks': [{
+                'hook': {
+                  'apiVersion': 'triliovault.trilio.io/v1',
+                  'kind': 'Hook',
+                  'name': restore_hook_name,
+                  'namespace': restore_namespace
+                },
+                'podSelector': {'regex': 'wordpress-mysql*'}
+              }],
+              'mode': 'Sequential',
+              'podReadyWaitSeconds': 120
+            }
+          }, recursive=True) }}
+
+    - name: Discover cluster ingress domain (auto-discover)
+      when: cluster_domain is not defined
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Ingress
+        name: cluster
+      register: _ingress_config
+
+    - name: Set route_hostname from discovered ingress domain
+      when: cluster_domain is not defined
+      ansible.builtin.set_fact:
+        _route_hostname: "{{ restore_namespace }}.{{ _ingress_config.resources[0].spec.domain }}"
+
+    - name: Set route_hostname from cluster_domain override
+      when: cluster_domain is defined
+      ansible.builtin.set_fact:
+        _route_hostname: "{{ restore_namespace }}.apps.{{ cluster_domain }}"
+
+    - name: Show Route hostname to be applied
+      ansible.builtin.debug:
+        msg: "Route transform hostname: {{ _route_hostname }}"
+
+    - name: Add Route hostname transform to Restore CR spec
+      ansible.builtin.set_fact:
+        _restore_spec: >-
+          {{ _restore_spec | combine({
+            'transformComponents': {
+              'custom': [{
+                'transformName': 'transform-route',
+                'jsonPatches': [{
+                  'op': 'replace',
+                  'path': '/spec/host',
+                  'value': _route_hostname
+                }],
+                'resources': {
+                  'groupVersionKind': {
+                    'group': 'route.openshift.io',
+                    'kind': 'Route',
+                    'version': 'v1'
+                  },
+                  'objects': ['wordpress']
+                }
+              }]
+            }
+          }, recursive=True) }}
+
+    - name: Create Restore CR ({{ restore_method }})
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Restore
+          metadata:
+            name: "{{ restore_name }}"
+            namespace: "{{ restore_namespace }}"
+          spec: "{{ _restore_spec }}"
+      register: restore_result
+
+    - name: Show Restore CR created
+      ansible.builtin.debug:
+        msg: >
+          Restore CR {{ restore_name }} created (method={{ restore_method }}).
+          Waiting for completion (timeout={{ timeout_seconds }}s)...
+
+    # -------------------------------------------------------------------------
+    # 8. Poll Restore status until Completed or Failed
+    # -------------------------------------------------------------------------
+    - name: Wait for Restore to complete
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Restore
+        name: "{{ restore_name }}"
+        namespace: "{{ restore_namespace }}"
+      register: restore_status
+      until: >
+        restore_status.resources | length > 0 and
+        (restore_status.resources[0].status.status | default('')) in ['Completed', 'Failed']
+      retries: "{{ (timeout_seconds | int / 10) | int }}"
+      delay: 10
+
+    - name: Assert Restore succeeded
+      ansible.builtin.assert:
+        that:
+          - restore_status.resources[0].status.status == 'Completed'
+        fail_msg: >
+          Restore {{ restore_name }} FAILED (method={{ restore_method }}).
+          Status: {{ restore_status.resources[0].status | to_nice_json }}
+        success_msg: >
+          Restore {{ restore_name }} completed successfully (method={{ restore_method }}).
+
+    # -------------------------------------------------------------------------
+    # 9. (Optional) Validate restored pods come up Running
+    #    This is the end-to-end application health check — confirming the data
+    #    path, not just Kubernetes object creation.
+    # -------------------------------------------------------------------------
+    - name: Validate restored pods are Running
+      when: validate_pods | bool
+      block:
+
+        - name: Wait for pods in {{ restore_namespace }} to reach Running state
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ restore_namespace }}"
+          register: pods_result
+          until: >
+            pods_result.resources | length > 0 and
+            pods_result.resources
+              | selectattr('status.phase', 'equalto', 'Running')
+              | list | length == pods_result.resources | length
+          retries: 30
+          delay: 10
+          failed_when: pods_result.resources | length == 0
+
+        - name: Assert all restored pods are Running
+          ansible.builtin.assert:
+            that:
+              - >
+                pods_result.resources
+                  | selectattr('status.phase', 'equalto', 'Running')
+                  | list | length == pods_result.resources | length
+            fail_msg: >
+              Not all pods are Running after restore in {{ restore_namespace }}:
+              {{ pods_result.resources
+                 | rejectattr('status.phase', 'equalto', 'Running')
+                 | map(attribute='metadata.name') | list }}
+            success_msg: >
+              PASS: All {{ pods_result.resources | length }} pods in
+              {{ restore_namespace }} are Running after restore.
+
+    # -------------------------------------------------------------------------
+    # 10. ConsistentSet: post-restore URL rewrite via direct database exec
+    #     ConsistentSet restores require the MySQL wp_options siteurl/home values
+    #     to be updated to the DR cluster URL.  This step runs the SQL directly
+    #     inside the MySQL container after the restore is confirmed complete.
+    # -------------------------------------------------------------------------
+    - name: Apply post-restore URL rewrite (method=consistentset)
+      when: restore_method == 'consistentset'
+      block:
+
+        - name: Find MySQL pod in {{ restore_namespace }}
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ restore_namespace }}"
+            label_selectors:
+              - "app=wordpress-mysql"
+          register: _mysql_pods
+          until: >
+            _mysql_pods.resources | length > 0 and
+            (_mysql_pods.resources[0].status.phase | default('')) == 'Running'
+          retries: 18
+          delay: 10
+          failed_when: _mysql_pods.resources | length == 0
+
+        - name: Rewrite wp_options URLs to DR cluster URL
+          kubernetes.core.k8s_exec:
+            namespace: "{{ restore_namespace }}"
+            pod: "{{ _mysql_pods.resources[0].metadata.name }}"
+            command:
+              - bash
+              - -c
+              - >-
+                mysql -u root --password=$MYSQL_ROOT_PASSWORD wordpress -Bse
+                "UPDATE wp_options SET option_value='http://{{ _route_hostname }}'
+                WHERE option_name IN ('siteurl','home')"
+          register: _wp_options_result
+
+        - name: Confirm URL rewrite applied
+          ansible.builtin.debug:
+            msg: "wp_options siteurl/home updated to http://{{ _route_hostname }}"
+
+    - name: Restore workflow complete
+      ansible.builtin.debug:
+        msg: >
+          PASS: Restore {{ restore_name }} complete (method={{ restore_method }}).
+          Namespace {{ restore_namespace }} is operational.

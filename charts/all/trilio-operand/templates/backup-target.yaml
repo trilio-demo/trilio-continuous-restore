@@ -1,0 +1,29 @@
+apiVersion: triliovault.trilio.io/v1
+kind: Target
+metadata:
+  name: trilio-s3-target
+  namespace: trilio-system
+  annotations:
+    # EventTarget enables the Trilio event pipeline on this cluster.
+    # On the primary cluster, Trilio directs backups toward the target.
+    # On the DR cluster, the EventTarget pod polls for new backups and
+    # pre-stages PVCs locally for accelerated RTO (Continuous Restore).
+    trilio.io/event-target: "true"
+    # Tell ArgoCD to use server-side diff for this resource so it only compares
+    # fields ArgoCD manages. Without this, Trilio's status writes cause the
+    # Target to show perpetually OutOfSync even though spec is correct.
+    argocd.argoproj.io/compare-options: "ServerSideDiff=true"
+spec:
+  enableBrowsing: {{ .Values.backupTarget.enableBrowsing }}
+  type: ObjectStore
+  vendor: AWS
+  objectStoreCredentials:
+    bucketName: {{ .Values.backupTarget.bucketName | quote }}
+    region: {{ .Values.backupTarget.region | quote }}
+    credentialSecret:
+      apiVersion: v1
+      kind: Secret
+      name: aws-s3-login
+      namespace: trilio-system
+    objectLockingEnabled: false
+    skipCertVerification: false

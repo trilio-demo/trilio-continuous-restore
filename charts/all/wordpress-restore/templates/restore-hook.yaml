@@ -1,0 +1,27 @@
+{{- $hostname := .Values.restoreHostname | default (printf "%s.%s" .Values.namespace .Values.global.localClusterDomain) }}
+# wordpress-restore-hook — post-restore Trilio Hook CR
+#
+# Must exist in the restore namespace BEFORE the Restore CR is created.
+# Trilio executes this hook post-restore against pods matching wordpress-mysql*.
+# It updates the MySQL wp_options table so WordPress internal links resolve
+# to the DR cluster URL rather than the source cluster URL.
+#
+# Rendered hostname: {{ $hostname }}
+# Source: global.localClusterDomain = {{ .Values.global.localClusterDomain }}
+apiVersion: triliovault.trilio.io/v1
+kind: Hook
+metadata:
+  name: wordpress-restore-hook
+  namespace: {{ .Values.namespace }}
+spec:
+  post:
+    execAction:
+      command:
+        - /bin/bash
+        - -c
+        - |
+          mysql -u root --password=$MYSQL_ROOT_PASSWORD wordpress -Bse \
+            "UPDATE wp_options SET option_value='http://{{ $hostname }}' WHERE option_name IN ('siteurl','home')"
+    ignoreFailure: true
+    maxRetryCount: 2
+    timeoutSeconds: 30

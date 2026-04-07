@@ -1,0 +1,28 @@
+apiVersion: triliovault.trilio.io/v1
+kind: TrilioVaultManager
+metadata:
+  name: triliovault-manager
+  namespace: {{ .Values.trilio.namespace | default "trilio-system" }}
+spec:
+  applicationScope: Cluster
+  componentConfiguration:
+    ingress-controller:
+      enabled: false
+  # dataJobResources: commented out to use Trilio defaults.
+  # Uncomment and tune for resource-constrained lab environments
+  # (e.g. shared RHPDS clusters where metamover pods need capped CPU/memory):
+  # dataJobResources:
+  #   requests:
+  #     cpu: 100m
+  #     memory: 800Mi
+  helmValues:
+    pollingIntervals:
+      manager: 30s
+      watcher: 30s
+      webSessionAccessTTL: 160h
+      webSessionMaxInactivityTTL: 24
+  metadataJobResources:
+    requests:
+      cpu: 10m
+      memory: 10Mi
+  tvkInstanceName: {{ tpl .Values.trilio.instanceName . | quote }}

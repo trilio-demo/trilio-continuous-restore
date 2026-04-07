@@ -1,0 +1,30 @@
+---
+# _validate_trilio_ready.yaml
+#
+# Shared pre-flight task file included by dr-backup.yaml and dr-restore.yaml.
+# Performs a lightweight check that the Trilio operator CSV is Succeeded
+# and the TrilioVaultManager is Ready before proceeding with DR operations.
+#
+# Not intended to be run standalone — use validate-trilio.yaml for full checks.
+
+- name: "[pre-flight] Check Trilio CSV is Succeeded"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ trilio_namespace }}"
+    label_selectors:
+      - "operators.coreos.com/k8s-triliovault.trilio-system"
+  register: _preflight_csv
+  failed_when: >
+    _preflight_csv.resources | length == 0 or
+    _preflight_csv.resources[0].status.phase != 'Succeeded'
+
+- name: "[pre-flight] Check TrilioVaultManager is Ready"
+  kubernetes.core.k8s_info:
+    api_version: triliovault.trilio.io/v1
+    kind: TrilioVaultManager
+    namespace: "{{ trilio_namespace }}"
+  register: _preflight_tvm
+  failed_when: >
+    _preflight_tvm.resources | length == 0 or
+    (_preflight_tvm.resources[0].status.status | default('')) not in ['Deployed', 'Updated']

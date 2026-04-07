@@ -1,0 +1,188 @@
+---
+# imperative-e2e-status.yaml
+#
+# Imperative framework job — Phase 4: aggregate hub-side E2E DR status and alert.
+#
+# Runs on a schedule (default every 10 minutes) via the Validated Patterns
+# imperative framework.  Checks the state of all hub-side DR phases and writes
+# a summary ConfigMap (trilio-dr-status) in the imperative namespace.
+#
+# ConfigMap is the alert mechanism — readable by:
+#   oc get configmap trilio-dr-status -n imperative -o yaml
+#
+# Phases checked (hub-scoped):
+#   Phase 1 — Backup:            Available Backup CR exists in wordpress ns
+#   Phase 2 — Standard Restore:  Completed Restore CR exists in wordpress-restore ns
+#   Phase 3a — CR BackupPlan:    Available CR-enabled BackupPlan exists in wordpress ns
+#   Phase 3b — CR Backup:        Available backup produced by that CR BackupPlan
+#              (proves the EventTarget pipeline is live and data is flowing)
+#
+# Spoke-side validation (ConsistentSet check) runs independently on each
+# secondary spoke via imperative-cr-status.yaml.
+#
+# Overall result: PASS only when all four hub phases are complete.
+# The playbook fails (non-zero exit) when overall result is FAIL, which causes
+# the VP framework to surface an alert in the imperative Job logs.
+
+- name: "Imperative Phase 4 — E2E DR status and alert"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    app_namespace: wordpress
+    restore_namespace: wordpress-restore
+    cr_backupplan_name: wordpress-backup-plan-cr
+    imperative_namespace: imperative
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Check Phase 1 — Available backup
+    # -------------------------------------------------------------------------
+    - name: Check for Available backup
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        namespace: "{{ app_namespace }}"
+      register: _backups
+
+    - name: Set phase1 status
+      ansible.builtin.set_fact:
+        _phase1_ok: >-
+          {{ _backups.resources
+             | selectattr('status.status', 'equalto', 'Available')
+             | list | length > 0 }}
+        _phase1_detail: >-
+          {{ (_backups.resources
+              | selectattr('status.status', 'equalto', 'Available')
+              | sort(attribute='metadata.creationTimestamp')
+              | map(attribute='metadata.name') | list | join(', '))
+             if (_backups.resources | selectattr('status.status', 'equalto', 'Available') | list | length > 0)
+             else 'No Available backup found' }}
+
+    # -------------------------------------------------------------------------
+    # 2. Check Phase 2 — Standard restore completed
+    # -------------------------------------------------------------------------
+    - name: Check for Completed restore
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Restore
+        namespace: "{{ restore_namespace }}"
+      register: _restores
+
+    - name: Set phase2 status
+      ansible.builtin.set_fact:
+        _phase2_ok: >-
+          {{ _restores.resources
+             | selectattr('status.status', 'equalto', 'Completed')
+             | list | length > 0 }}
+        _phase2_detail: >-
+          {{ (_restores.resources
+              | selectattr('status.status', 'equalto', 'Completed')
+              | map(attribute='metadata.name') | list | join(', '))
+             if (_restores.resources | selectattr('status.status', 'equalto', 'Completed') | list | length > 0)
+             else 'No Completed restore in ' + restore_namespace }}
+
+    # -------------------------------------------------------------------------
+    # 3. Check Phase 3a — CR BackupPlan available
+    # -------------------------------------------------------------------------
+    - name: Check CR BackupPlan status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ cr_backupplan_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _cr_bp
+
+    - name: Set phase3a status
+      ansible.builtin.set_fact:
+        _phase3a_ok: >-
+          {{ _cr_bp.resources | length > 0 and
+             (_cr_bp.resources[0].status.status | default('')) == 'Available' }}
+        _phase3a_detail: >-
+          {{ 'Available' if (_cr_bp.resources | length > 0 and
+             (_cr_bp.resources[0].status.status | default('')) == 'Available')
+             else (_cr_bp.resources[0].status.status | default('Not found')) if _cr_bp.resources | length > 0
+             else 'CR BackupPlan ' + cr_backupplan_name + ' not found' }}
+
+    # -------------------------------------------------------------------------
+    # 4. Check Phase 3b — CR-enabled backup exists (proves EventTarget pipeline active)
+    #    ConsistentSets live on the DR spoke and are not visible from the hub.
+    #    A CR-enabled backup in the app namespace is the hub-visible proof that
+    #    the Continuous Restore pipeline is running end-to-end.
+    # -------------------------------------------------------------------------
+    - name: Check for Available CR-enabled backup
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        namespace: "{{ app_namespace }}"
+      register: _all_backups
+
+    - name: Set phase3b status
+      ansible.builtin.set_fact:
+        _phase3b_cr_backups: >-
+          {{ _all_backups.resources
+             | selectattr('spec.backupPlan.name', 'defined')
+             | selectattr('spec.backupPlan.name', 'equalto', cr_backupplan_name)
+             | selectattr('status.status', 'equalto', 'Available')
+             | list }}
+
+    - name: Set phase3b ok/detail
+      ansible.builtin.set_fact:
+        _phase3b_ok: "{{ _phase3b_cr_backups | length > 0 }}"
+        _phase3b_detail: >-
+          {{ (_phase3b_cr_backups | map(attribute='metadata.name') | list | join(', '))
+             if _phase3b_cr_backups | length > 0
+             else 'No Available backup from CR BackupPlan ' + cr_backupplan_name + ' found' }}
+
+    # -------------------------------------------------------------------------
+    # 5. Compute overall result
+    # -------------------------------------------------------------------------
+    - name: Compute overall E2E result
+      ansible.builtin.set_fact:
+        _overall_pass: "{{ _phase1_ok | bool and _phase2_ok | bool and _phase3a_ok | bool and _phase3b_ok | bool }}"
+
+    # -------------------------------------------------------------------------
+    # 6. Write status ConfigMap
+    # -------------------------------------------------------------------------
+    - name: Write trilio-dr-status ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: trilio-dr-status
+            namespace: "{{ imperative_namespace }}"
+            annotations:
+              last-updated: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          data:
+            overall: "{{ 'PASS' if _overall_pass else 'FAIL' }}"
+            phase1_backup: "{{ 'PASS' if _phase1_ok else 'FAIL' }} — {{ _phase1_detail }}"
+            phase2_restore_standard: "{{ 'PASS' if _phase2_ok else 'FAIL' }} — {{ _phase2_detail }}"
+            phase3a_cr_backupplan: "{{ 'PASS' if _phase3a_ok else 'FAIL' }} — {{ _phase3a_detail }}"
+            phase3b_cr_backup: "{{ 'PASS' if _phase3b_ok else 'FAIL' }} — {{ _phase3b_detail }}"
+
+    - name: Show E2E status summary
+      ansible.builtin.debug:
+        msg:
+          - "E2E DR Status: {{ 'PASS ✓' if _overall_pass else 'FAIL ✗' }}"
+          - "  Phase 1 — Backup:            {{ 'PASS' if _phase1_ok else 'FAIL' }} — {{ _phase1_detail }}"
+          - "  Phase 2 — Standard Restore:  {{ 'PASS' if _phase2_ok else 'FAIL' }} — {{ _phase2_detail }}"
+          - "  Phase 3a — CR BackupPlan:    {{ 'PASS' if _phase3a_ok else 'FAIL' }} — {{ _phase3a_detail }}"
+          - "  Phase 3b — CR Backup:        {{ 'PASS' if _phase3b_ok else 'FAIL' }} — {{ _phase3b_detail }}"
+          - "  ConfigMap: oc get configmap trilio-dr-status -n {{ imperative_namespace }} -o yaml"
+
+    # -------------------------------------------------------------------------
+    # 7. Fail the job if E2E is not yet complete (surfaces in VP framework logs)
+    #    This is intentional: the framework will retry next cycle.
+    #    Once all phases pass, the job succeeds and stops retrying until reset.
+    # -------------------------------------------------------------------------
+    - name: Fail if E2E DR is not complete
+      ansible.builtin.fail:
+        msg: >
+          E2E DR not yet complete. Check ConfigMap trilio-dr-status in {{ imperative_namespace }}
+          for phase details. The job will retry next cycle.
+      when: not _overall_pass | bool

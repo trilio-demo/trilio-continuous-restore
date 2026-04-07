@@ -1,0 +1,254 @@
+---
+# imperative-enable-cr.yaml
+#
+# Imperative framework job — Phase 3: enable Continuous Restore for all
+# secondary DR clusters that have Trilio up and registered with the hub Target.
+#
+# Runs on a schedule (default every 10 minutes) via the Validated Patterns
+# imperative framework.  Idempotent: skips clusters that already have a CR
+# BackupPlan.  Skips clusters whose Trilio instance is not yet visible in
+# the Target status (not ready — will retry next cycle).
+#
+# DR cluster discovery:
+#   Queries ACM ManagedClusters with label clusterGroup=secondary.
+#   Each cluster's infrastructure name is used as the spoke_cluster_name to
+#   look up in the Target CR's availableContinuousRestoreInstances.
+#
+# For each eligible DR cluster this playbook:
+#   1. Checks if a ContinuousRestore Policy CR already exists — skips if yes
+#   2. Checks if the cluster appears in Target status — skips if not yet
+#   3. Creates ContinuousRestore Policy (consistentSets count)
+#   4. Creates CR-enabled BackupPlan (Ansible-owned, no ArgoCD tracking)
+#   5. Waits for BackupPlan to reach Available
+
+- name: "Imperative Phase 3 — Enable Continuous Restore for secondary DR clusters"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    app_namespace: wordpress
+    target_name: trilio-s3-target
+    hook_name: wordpress-mysql-hook
+    hook_pod_selector: "wordpress-mysql*"
+    cr_backupplan_name: wordpress-backup-plan-cr
+    cr_policy_name: cr-policy-3
+    consistent_sets: 3
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Soft Trilio health check on hub
+    # -------------------------------------------------------------------------
+    - name: Check hub Trilio CSV
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ trilio_namespace }}"
+        label_selectors:
+          - "operators.coreos.com/k8s-triliovault.trilio-system"
+      register: _csv
+
+    - name: Check hub TrilioVaultManager
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: TrilioVaultManager
+        namespace: "{{ trilio_namespace }}"
+      register: _tvm
+
+    - name: Skip if hub Trilio is not yet healthy
+      ansible.builtin.meta: end_play
+      when: >
+        _csv.resources | length == 0 or
+        _csv.resources[0].status.phase != 'Succeeded' or
+        _tvm.resources | length == 0 or
+        (_tvm.resources[0].status.status | default('')) not in ['Deployed', 'Updated']
+
+    # -------------------------------------------------------------------------
+    # 2. Skip if CR BackupPlan already exists and is Available
+    # -------------------------------------------------------------------------
+    - name: Check if CR BackupPlan already exists
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ cr_backupplan_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _existing_bp
+
+    - name: Skip if CR BackupPlan already Available
+      ansible.builtin.meta: end_play
+      when: >
+        _existing_bp.resources | length > 0 and
+        (_existing_bp.resources[0].status.status | default('')) == 'Available'
+
+    # -------------------------------------------------------------------------
+    # 3. Discover secondary DR clusters from ACM
+    # -------------------------------------------------------------------------
+    - name: List ACM ManagedClusters
+      kubernetes.core.k8s_info:
+        api_version: cluster.open-cluster-management.io/v1
+        kind: ManagedCluster
+      register: _managed_clusters
+
+    - name: Filter for secondary clusters (excluding local-cluster)
+      ansible.builtin.set_fact:
+        _dr_clusters: >-
+          {{ _managed_clusters.resources
+             | selectattr('metadata.labels.clusterGroup', 'defined')
+             | selectattr('metadata.labels.clusterGroup', 'equalto', 'secondary')
+             | rejectattr('metadata.name', 'equalto', 'local-cluster')
+             | list }}
+
+    - name: Skip if no secondary clusters found yet
+      ansible.builtin.meta: end_play
+      when: _dr_clusters | length == 0
+
+    - name: Show discovered DR clusters
+      ansible.builtin.debug:
+        msg: "Found {{ _dr_clusters | length }} secondary DR cluster(s): {{ _dr_clusters | map(attribute='metadata.name') | list }}"
+
+    # -------------------------------------------------------------------------
+    # 4. Get hub Target CR — must be Available and have CR instances registered
+    # -------------------------------------------------------------------------
+    - name: Get hub Target CR
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Target
+        name: "{{ target_name }}"
+        namespace: "{{ trilio_namespace }}"
+      register: _target
+
+    - name: Skip if Target is not Available
+      ansible.builtin.meta: end_play
+      when: >
+        _target.resources | length == 0 or
+        (_target.resources[0].status.status | default('')) != 'Available'
+
+    - name: Skip if no CR instances registered yet
+      ansible.builtin.meta: end_play
+      when: >
+        (_target.resources[0].status.availableContinuousRestoreInstances | default({})) | length == 0
+
+    # -------------------------------------------------------------------------
+    # 5. Find the first DR cluster that appears in Target CR instances.
+    #    The TVM instanceName is the OCP cluster name (global.localClusterName),
+    #    NOT the ACM ManagedCluster import name. Extract the OCP cluster name
+    #    from the apiserverurl.openshift.io claim (first label after "api.").
+    # -------------------------------------------------------------------------
+    - name: Build list of OCP cluster names from secondary ACM clusters
+      ansible.builtin.set_fact:
+        _dr_cluster_ocp_names: >-
+          {{ _dr_clusters
+             | map(attribute='status.clusterClaims')
+             | flatten
+             | selectattr('name', 'equalto', 'apiserverurl.openshift.io')
+             | map(attribute='value')
+             | map('regex_replace', '^https://api\.([^.]+)\..*', '\1')
+             | list }}
+
+    - name: Match DR cluster OCP name to Target instance
+      ansible.builtin.set_fact:
+        _spoke_cluster_name: >-
+          {{ (_dr_cluster_ocp_names
+              | select('in',
+                  (_target.resources[0].status.availableContinuousRestoreInstances
+                   | dict2items | map(attribute='value.instanceName') | list))
+              | list | first) | default('') }}
+
+    - name: Skip if no DR cluster is registered in Target yet
+      ansible.builtin.meta: end_play
+      when: _spoke_cluster_name | length == 0
+
+    - name: Extract spoke instanceID
+      ansible.builtin.set_fact:
+        _spoke_instance_id: >-
+          {{ (_target.resources[0].status.availableContinuousRestoreInstances
+              | dict2items
+              | selectattr('value.instanceName', 'equalto', _spoke_cluster_name)
+              | map(attribute='key')
+              | list
+              | first) | default('') }}
+
+    - name: Show matched DR cluster
+      ansible.builtin.debug:
+        msg: "DR cluster '{{ _spoke_cluster_name }}' instanceID: {{ _spoke_instance_id }}"
+
+    # -------------------------------------------------------------------------
+    # 6. Create ContinuousRestore Policy
+    # -------------------------------------------------------------------------
+    - name: Create ContinuousRestore Policy {{ cr_policy_name }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Policy
+          metadata:
+            name: "{{ cr_policy_name }}"
+            namespace: "{{ app_namespace }}"
+          spec: "{{ {'type': 'ContinuousRestore', 'default': False, 'continuousRestoreConfig': {'consistentSets': consistent_sets | int}} }}"
+
+    # -------------------------------------------------------------------------
+    # 7. Create CR-enabled BackupPlan (Ansible-owned, no ArgoCD tracking)
+    # -------------------------------------------------------------------------
+    - name: Create CR BackupPlan {{ cr_backupplan_name }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: BackupPlan
+          metadata:
+            name: "{{ cr_backupplan_name }}"
+            namespace: "{{ app_namespace }}"
+          spec:
+            backupConfig:
+              target:
+                apiVersion: triliovault.trilio.io/v1
+                kind: Target
+                name: "{{ target_name }}"
+                namespace: "{{ trilio_namespace }}"
+            hookConfig:
+              hooks:
+                - hook:
+                    apiVersion: triliovault.trilio.io/v1
+                    kind: Hook
+                    name: "{{ hook_name }}"
+                    namespace: "{{ app_namespace }}"
+                  podSelector:
+                    regex: "{{ hook_pod_selector }}"
+              mode: Sequential
+              podReadyWaitSeconds: 120
+            snapshotConfig:
+              target:
+                apiVersion: triliovault.trilio.io/v1
+                kind: Target
+                name: "{{ target_name }}"
+                namespace: "{{ trilio_namespace }}"
+            continuousRestoreConfig:
+              continuousRestoreInstances:
+                - instanceID: "{{ _spoke_instance_id }}"
+                  continuousRestorePolicy:
+                    apiVersion: triliovault.trilio.io/v1
+                    kind: Policy
+                    name: "{{ cr_policy_name }}"
+                    namespace: "{{ app_namespace }}"
+
+    - name: Wait for CR BackupPlan to reach Available
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ cr_backupplan_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _bp_status
+      until: >
+        _bp_status.resources | length > 0 and
+        (_bp_status.resources[0].status.status | default('')) in ['Available', 'Failed']
+      retries: 36
+      delay: 10
+
+    - name: Assert CR BackupPlan is Available
+      ansible.builtin.assert:
+        that:
+          - _bp_status.resources[0].status.status == 'Available'
+        fail_msg: "CR BackupPlan {{ cr_backupplan_name }} did not reach Available: {{ _bp_status.resources[0].status | to_nice_json }}"
+        success_msg: "PASS: CR BackupPlan {{ cr_backupplan_name }} Available. DR cluster {{ _spoke_cluster_name }} registered for Continuous Restore."

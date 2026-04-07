@@ -1,0 +1,19 @@
+namespace: wordpress
+
+mysql:
+  image: mysql:5.6
+  storage: 5Gi
+  # Production: override via ESO ExternalSecret from Vault (secret/global/wordpress-mysql)
+  # Dev/test: set password directly here
+  password: "mysql123456"
+
+wordpress:
+  image: wordpress:4.8-apache
+  storage: 5Gi
+  dbHost: wordpress-mysql
+  route:
+    # Leave empty to let OpenShift generate the hostname
+    host: ""
+
+serviceAccount:
+  name: wordpress-sa

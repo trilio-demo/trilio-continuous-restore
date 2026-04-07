@@ -1,0 +1,4 @@
+apiVersion: v2
+description: A Helm chart to deploy Trilio ExternalSecrets before trilio-operand
+name: trilio-secrets
+version: 0.1.0

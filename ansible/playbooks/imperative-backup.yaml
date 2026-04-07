@@ -1,0 +1,129 @@
+---
+# imperative-backup.yaml
+#
+# Imperative framework job — Phase 1: ensure a Trilio backup exists.
+#
+# Runs on a schedule (default every 10 minutes) via the Validated Patterns
+# imperative framework.  Idempotent: exits cleanly if an Available backup
+# already exists.  Skips gracefully if Trilio is not yet healthy.
+#
+# Flow:
+#   1. Soft-check Trilio health (skip, do not fail, if not ready)
+#   2. Check for an existing Available backup in app_namespace
+#   3. If one exists → exit (nothing to do)
+#   4. If none exists → create a new Backup CR and poll to completion
+
+- name: "Imperative Phase 1 — Ensure backup exists"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    app_namespace: wordpress
+    backupplan_name: wordpress-backup-plan
+    backup_name: "imperative-backup-{{ lookup('pipe', 'date +%Y%m%d-%Hh%M') }}"
+    backup_type: Full
+    timeout_seconds: 1200
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Soft Trilio health check
+    #    Do not fail — just skip the rest if Trilio is not ready yet.
+    #    The VP framework will re-run this job in the next cycle.
+    # -------------------------------------------------------------------------
+    - name: Check Trilio CSV phase
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ trilio_namespace }}"
+        label_selectors:
+          - "operators.coreos.com/k8s-triliovault.trilio-system"
+      register: _csv
+
+    - name: Check TrilioVaultManager status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: TrilioVaultManager
+        namespace: "{{ trilio_namespace }}"
+      register: _tvm
+
+    - name: Skip if Trilio is not yet healthy
+      ansible.builtin.meta: end_play
+      when: >
+        _csv.resources | length == 0 or
+        _csv.resources[0].status.phase != 'Succeeded' or
+        _tvm.resources | length == 0 or
+        (_tvm.resources[0].status.status | default('')) not in ['Deployed', 'Updated']
+
+    # -------------------------------------------------------------------------
+    # 2. Check whether an Available backup already exists
+    # -------------------------------------------------------------------------
+    - name: List backups in {{ app_namespace }}
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        namespace: "{{ app_namespace }}"
+      register: _existing_backups
+
+    - name: Skip if Available backup already exists
+      ansible.builtin.meta: end_play
+      when: >
+        _existing_backups.resources
+          | selectattr('status.status', 'equalto', 'Available')
+          | list | length > 0
+
+    # -------------------------------------------------------------------------
+    # 3. No backup found — verify BackupPlan is Available before proceeding
+    # -------------------------------------------------------------------------
+    - name: Check BackupPlan is Available
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ backupplan_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _bp
+      failed_when: >
+        _bp.resources | length == 0 or
+        (_bp.resources[0].status.status | default('')) != 'Available'
+
+    # -------------------------------------------------------------------------
+    # 4. Create Backup CR and poll to completion
+    # -------------------------------------------------------------------------
+    - name: Create Backup CR {{ backup_name }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Backup
+          metadata:
+            name: "{{ backup_name }}"
+            namespace: "{{ app_namespace }}"
+          spec:
+            backupPlan:
+              apiVersion: triliovault.trilio.io/v1
+              kind: BackupPlan
+              name: "{{ backupplan_name }}"
+              namespace: "{{ app_namespace }}"
+            type: "{{ backup_type }}"
+
+    - name: Wait for Backup to complete
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        name: "{{ backup_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _backup_status
+      until: >
+        _backup_status.resources | length > 0 and
+        (_backup_status.resources[0].status.status | default('')) in ['Available', 'Failed']
+      retries: "{{ (timeout_seconds | int / 15) | int }}"
+      delay: 15
+
+    - name: Assert Backup succeeded
+      ansible.builtin.assert:
+        that:
+          - _backup_status.resources[0].status.status == 'Available'
+        fail_msg: "Backup {{ backup_name }} FAILED: {{ _backup_status.resources[0].status | to_nice_json }}"
+        success_msg: "PASS: Backup {{ backup_name }} is Available."

@@ -1,0 +1,135 @@
+---
+# dr-backup.yaml
+#
+# Triggers a Trilio Backup CR against an existing BackupPlan and polls until
+# the Backup reaches Available (success) or Failed.
+#
+# The BackupPlan is managed declaratively by ArgoCD (charts/all/wordpress) —
+# this playbook does NOT create or modify it. The BackupPlan already defines
+# which namespace to protect, which Target (S3) to use, and the hook config.
+# This playbook only verifies the BackupPlan is healthy before triggering a run.
+#
+# Trilio CRs involved:
+#   BackupPlan  - defines WHAT to back up (managed by ArgoCD, not this playbook)
+#   Backup      - triggers a single point-in-time backup run against a BackupPlan
+#
+# Usage:
+#   ansible-playbook ansible/playbooks/dr-backup.yaml \
+#     [-e backup_name=wordpress-backup-20260305-14h25] \
+#     [-e backup_type=Incremental]
+#
+# Optional variables:
+#   backup_name:       name for the Backup CR (default: wordpress-backup-<timestamp>)
+#                      e.g. wordpress-backup-20260305-14h25
+#                      Override with -e backup_name=my-custom-name
+#   backup_type:       Full or Incremental (default: Full)
+#                      If Incremental is requested and no prior Full exists,
+#                      Trilio automatically promotes it to a Full backup.
+#   backupplan_name:   name of the BackupPlan CR to trigger (default: wordpress-backup-plan)
+#   backup_namespace:  namespace where BackupPlan and Backup CRs live (default: wordpress)
+#   trilio_namespace:  namespace where Trilio is installed (default: trilio-system)
+#   timeout_seconds:   polling timeout in seconds (default: 1800)
+
+- name: Trigger Trilio DR backup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    backup_name: "wordpress-backup-{{ lookup('pipe', 'date +%Y%m%d-%Hh%M') }}"
+    backup_type: Full
+    backupplan_name: wordpress-backup-plan
+    backup_namespace: wordpress
+    trilio_namespace: trilio-system
+    timeout_seconds: 1800
+
+  pre_tasks:
+    - name: Assert required variables are set
+      ansible.builtin.assert:
+        that:
+          - backup_type in ['Full', 'Incremental']
+        fail_msg: >
+          Invalid variable: backup_type must be Full or Incremental (default: Full)
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Run pre-flight validation first
+    # -------------------------------------------------------------------------
+    - name: Confirm Trilio is healthy before attempting backup
+      ansible.builtin.include_tasks: _validate_trilio_ready.yaml
+
+    # -------------------------------------------------------------------------
+    # 2. Verify the BackupPlan exists and is Available
+    #    The BackupPlan is managed by ArgoCD — we do not create or modify it here.
+    #    It already encodes the Target, namespace scope, and hook configuration.
+    # -------------------------------------------------------------------------
+    - name: Get existing BackupPlan CR
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ backupplan_name }}"
+        namespace: "{{ backup_namespace }}"
+      register: bp_result
+      failed_when: >
+        bp_result.resources | length == 0 or
+        (bp_result.resources[0].status.status | default('')) != 'Available'
+
+    - name: Show BackupPlan status
+      ansible.builtin.debug:
+        msg: "BackupPlan {{ backupplan_name }} is Available."
+
+    # -------------------------------------------------------------------------
+    # 3. Create Backup CR
+    #    References the existing BackupPlan and triggers a backup run.
+    #    Full: complete snapshot of all resources and PVC data.
+    #    Incremental: changed blocks only; Trilio promotes to Full automatically
+    #    if no prior Full backup exists for this BackupPlan.
+    # -------------------------------------------------------------------------
+    - name: Create Backup CR {{ backup_name }} ({{ backup_type }})
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Backup
+          metadata:
+            name: "{{ backup_name }}"
+            namespace: "{{ backup_namespace }}"
+          spec:
+            backupPlan:
+              name: "{{ backupplan_name }}"
+              namespace: "{{ backup_namespace }}"
+            type: "{{ backup_type }}"
+
+    - name: Show Backup CR created
+      ansible.builtin.debug:
+        msg: "Backup CR {{ backup_name }} ({{ backup_type }}) created. Waiting for completion..."
+
+    # -------------------------------------------------------------------------
+    # 4. Poll Backup status until Available (success) or Failed
+    # -------------------------------------------------------------------------
+    - name: Wait for Backup to complete
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        name: "{{ backup_name }}"
+        namespace: "{{ backup_namespace }}"
+      register: backup_status
+      until: >
+        backup_status.resources | length > 0 and
+        (backup_status.resources[0].status.status | default('')) in ['Available', 'Failed']
+      retries: "{{ (timeout_seconds | int / 10) | int }}"
+      delay: 10
+
+    - name: Assert Backup succeeded
+      ansible.builtin.assert:
+        that:
+          - backup_status.resources[0].status.status == 'Available'
+        fail_msg: >
+          Backup {{ backup_name }} FAILED.
+          Status: {{ backup_status.resources[0].status | to_nice_json }}
+        success_msg: >
+          PASS: Backup {{ backup_name }} ({{ backup_type }}) completed successfully.
+          Duration: {{ backup_status.resources[0].status.duration | default('unknown') }}
+          Size: {{ backup_status.resources[0].status.size | default('unknown') }}
+          Location: {{ backup_status.resources[0].status.location | default('unknown') }}

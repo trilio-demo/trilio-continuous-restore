@@ -1,0 +1,15 @@
+# Secrets — never commit
+values-secret*
+pattern-vault.init
+vault.init
+
+# Editor / OS
+*.swp
+*.swo
+.*.expected.yaml
+*.code-workspace
+.DS_Store
+
+# Claude (internal tooling)
+CLAUDE.md
+.claude/

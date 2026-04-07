@@ -1,0 +1,10 @@
+namespace: wordpress-restore
+
+serviceAccount:
+  name: wordpress-sa
+
+# restoreHostname is the full Route hostname for the restored WordPress app on this cluster.
+# Derived at render time from the VP framework variable global.localClusterDomain
+# (e.g. apps.dr-cluster.example.com → wordpress-restore.apps.dr-cluster.example.com).
+# Override only if auto-discovery is unavailable.
+restoreHostname: ""

@@ -1,0 +1,125 @@
+---
+# imperative-cr-status.yaml
+#
+# Imperative framework job — Spoke: validate Continuous Restore data delivery.
+#
+# Runs on a schedule (default every 10 minutes) on each secondary spoke via the
+# Validated Patterns imperative framework.  Checks that the Continuous Restore
+# pipeline is delivering data to this spoke by looking for Available ConsistentSets.
+#
+# A ConsistentSet is created on the spoke each time the CR pipeline completes a
+# cycle: hub backup → EventTarget notification → spoke ConsistentSet Available.
+# At least one Available ConsistentSet proves the full CR pipeline is running
+# end-to-end from hub backup through to spoke-side data delivery.
+#
+# Result written to:
+#   oc get configmap trilio-cr-status -n imperative -o yaml
+#
+# Overall result: PASS when at least one Available ConsistentSet exists.
+# The playbook fails (non-zero exit) until PASS, causing the VP framework to
+# retry every cycle and surface an alert in the imperative Job logs.
+
+- name: "Spoke Imperative — Continuous Restore ConsistentSet validation"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    imperative_namespace: imperative
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Soft Trilio health check
+    # -------------------------------------------------------------------------
+    - name: Check Trilio CSV phase
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ trilio_namespace }}"
+        label_selectors:
+          - "operators.coreos.com/k8s-triliovault.trilio-system"
+      register: _csv
+
+    - name: Check TrilioVaultManager status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: TrilioVaultManager
+        namespace: "{{ trilio_namespace }}"
+      register: _tvm
+
+    - name: Skip if Trilio is not yet healthy
+      ansible.builtin.meta: end_play
+      when: >
+        _csv.resources | length == 0 or
+        _csv.resources[0].status.phase != 'Succeeded' or
+        _tvm.resources | length == 0 or
+        (_tvm.resources[0].status.status | default('')) not in ['Deployed', 'Updated']
+
+    # -------------------------------------------------------------------------
+    # 2. Check for Available ConsistentSets (cluster-scoped)
+    # -------------------------------------------------------------------------
+    - name: List ConsistentSets
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: ConsistentSet
+      register: _consistentsets
+
+    - name: Set ConsistentSet status facts
+      ansible.builtin.set_fact:
+        _available_cs: >-
+          {{ _consistentsets.resources
+             | selectattr('status.status', 'defined')
+             | selectattr('status.status', 'equalto', 'Available')
+             | list }}
+        _cs_count: "{{ _consistentsets.resources | length }}"
+
+    - name: Set overall pass/fail
+      ansible.builtin.set_fact:
+        _cr_pass: "{{ _available_cs | length > 0 }}"
+        _cr_detail: >-
+          {{ (_available_cs | map(attribute='metadata.name') | list | join(', '))
+             if _available_cs | length > 0
+             else ('ConsistentSets exist but none Available (' + (_cs_count | string) + ' found)')
+                  if _cs_count | int > 0
+                  else 'No ConsistentSets found — CR pipeline has not delivered data yet' }}
+
+    # -------------------------------------------------------------------------
+    # 3. Write status ConfigMap
+    # -------------------------------------------------------------------------
+    - name: Write trilio-cr-status ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: trilio-cr-status
+            namespace: "{{ imperative_namespace }}"
+            annotations:
+              last-updated: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          data:
+            overall: "{{ 'PASS' if _cr_pass else 'FAIL' }}"
+            consistent_sets_available: "{{ _available_cs | length | string }}"
+            detail: "{{ 'PASS' if _cr_pass else 'FAIL' }} — {{ _cr_detail }}"
+
+    - name: Show CR status summary
+      ansible.builtin.debug:
+        msg:
+          - "Spoke CR Status: {{ 'PASS ✓' if _cr_pass else 'FAIL ✗' }}"
+          - "  ConsistentSets Available: {{ _available_cs | length }}"
+          - "  Detail: {{ _cr_detail }}"
+          - "  ConfigMap: oc get configmap trilio-cr-status -n {{ imperative_namespace }} -o yaml"
+
+    # -------------------------------------------------------------------------
+    # 4. Fail the job if no ConsistentSets are Available yet
+    #    The framework will retry next cycle.
+    # -------------------------------------------------------------------------
+    - name: Fail if no Available ConsistentSets found
+      ansible.builtin.fail:
+        msg: >
+          Continuous Restore has not delivered data to this spoke yet.
+          Check ConfigMap trilio-cr-status in {{ imperative_namespace }} for details.
+          The job will retry next cycle.
+      when: not _cr_pass | bool

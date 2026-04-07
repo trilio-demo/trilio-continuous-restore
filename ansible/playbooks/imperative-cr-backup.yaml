@@ -1,0 +1,132 @@
+---
+# imperative-cr-backup.yaml
+#
+# Imperative framework job — Phase 2: ensure a Continuous Restore backup exists.
+#
+# Runs on a schedule (default every 10 minutes) via the Validated Patterns
+# imperative framework.  Idempotent: exits cleanly if an Available backup
+# already exists for the CR BackupPlan.  Skips if the CR BackupPlan is not
+# yet Available (Phase 1 — trilio-enable-cr — not complete yet).
+#
+# Flow:
+#   1. Soft-check Trilio health (skip if not ready)
+#   2. Skip if CR BackupPlan does not exist or is not Available yet
+#   3. Skip if an Available CR backup already exists
+#   4. Create a Backup CR against wordpress-backup-plan-cr and poll to completion
+
+- name: "Imperative Phase 2 — Ensure Continuous Restore backup exists"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    app_namespace: wordpress
+    cr_backupplan_name: wordpress-backup-plan-cr
+    backup_name: "imperative-cr-backup-{{ lookup('pipe', 'date +%Y%m%d-%Hh%M') }}"
+    backup_type: Full
+    timeout_seconds: 1200
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Soft Trilio health check
+    # -------------------------------------------------------------------------
+    - name: Check Trilio CSV phase
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ trilio_namespace }}"
+        label_selectors:
+          - "operators.coreos.com/k8s-triliovault.trilio-system"
+      register: _csv
+
+    - name: Check TrilioVaultManager status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: TrilioVaultManager
+        namespace: "{{ trilio_namespace }}"
+      register: _tvm
+
+    - name: Skip if Trilio is not yet healthy
+      ansible.builtin.meta: end_play
+      when: >
+        _csv.resources | length == 0 or
+        _csv.resources[0].status.phase != 'Succeeded' or
+        _tvm.resources | length == 0 or
+        (_tvm.resources[0].status.status | default('')) not in ['Deployed', 'Updated']
+
+    # -------------------------------------------------------------------------
+    # 2. Skip if CR BackupPlan is not yet Available (trilio-enable-cr pending)
+    # -------------------------------------------------------------------------
+    - name: Check CR BackupPlan status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ cr_backupplan_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _cr_bp
+
+    - name: Skip if CR BackupPlan not yet Available
+      ansible.builtin.meta: end_play
+      when: >
+        _cr_bp.resources | length == 0 or
+        (_cr_bp.resources[0].status.status | default('')) != 'Available'
+
+    # -------------------------------------------------------------------------
+    # 3. Skip if an Available backup against the CR BackupPlan already exists
+    # -------------------------------------------------------------------------
+    - name: List backups in {{ app_namespace }}
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        namespace: "{{ app_namespace }}"
+      register: _existing_backups
+
+    - name: Skip if Available CR backup already exists
+      ansible.builtin.meta: end_play
+      when: >
+        _existing_backups.resources
+          | selectattr('spec.backupPlan.name', 'equalto', cr_backupplan_name)
+          | selectattr('status.status', 'equalto', 'Available')
+          | list | length > 0
+
+    # -------------------------------------------------------------------------
+    # 4. Create Backup CR against the CR BackupPlan and poll to completion
+    # -------------------------------------------------------------------------
+    - name: Create CR Backup {{ backup_name }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Backup
+          metadata:
+            name: "{{ backup_name }}"
+            namespace: "{{ app_namespace }}"
+          spec:
+            backupPlan:
+              apiVersion: triliovault.trilio.io/v1
+              kind: BackupPlan
+              name: "{{ cr_backupplan_name }}"
+              namespace: "{{ app_namespace }}"
+            type: "{{ backup_type }}"
+
+    - name: Wait for CR Backup to complete
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        name: "{{ backup_name }}"
+        namespace: "{{ app_namespace }}"
+      register: _backup_status
+      until: >
+        _backup_status.resources | length > 0 and
+        (_backup_status.resources[0].status.status | default('')) in ['Available', 'Failed']
+      retries: "{{ (timeout_seconds | int / 15) | int }}"
+      delay: 15
+
+    - name: Assert CR Backup succeeded
+      ansible.builtin.assert:
+        that:
+          - _backup_status.resources[0].status.status == 'Available'
+        fail_msg: "CR Backup {{ backup_name }} FAILED: {{ _backup_status.resources[0].status | to_nice_json }}"
+        success_msg: "PASS: CR Backup {{ backup_name }} is Available. Continuous Restore replication active to spoke."

@@ -1,0 +1,24 @@
+apiVersion: triliovault.trilio.io/v1
+kind: Hook
+metadata:
+  name: wordpress-mysql-hook
+  namespace: wordpress
+spec:
+  pre:
+    execAction:
+      command:
+        - /bin/bash
+        - -c
+        - mysql -u root --password=$MYSQL_ROOT_PASSWORD -Bse 'FLUSH TABLES WITH READ LOCK'
+    ignoreFailure: false
+    maxRetryCount: 1
+    timeoutSeconds: 10
+  post:
+    execAction:
+      command:
+        - /bin/bash
+        - -c
+        - mysql --user=root --password=$MYSQL_ROOT_PASSWORD -Bse 'FLUSH LOGS; UNLOCK TABLES'
+    ignoreFailure: false
+    maxRetryCount: 1
+    timeoutSeconds: 10

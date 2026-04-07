@@ -1,0 +1,158 @@
+---
+# validate-trilio.yaml
+#
+# Pre-flight validation: confirms the Trilio operator, TrilioVaultManager operand,
+# and License CR are all healthy before attempting DR workflows.
+#
+# Usage:
+#   ansible-playbook ansible/playbooks/validate-trilio.yaml
+#
+# Optional variables:
+#   trilio_namespace:  namespace where Trilio is installed (default: trilio-system)
+#   timeout_seconds:   how long to wait for each condition (default: 300)
+
+- name: Validate Trilio deployment health
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    timeout_seconds: 300
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 0. Pre-requisite: confirm a CSI-backed default StorageClass exists
+    #
+    # Trilio requires a CSI driver to snapshot PVCs. The cluster must have at
+    # least one StorageClass marked as default that uses a CSI provisioner
+    # (provisioner name contains ".csi."). ODF (ocs-storagecluster-ceph-rbd) is
+    # the recommended choice on OpenShift, but any CSI driver is acceptable.
+    # -------------------------------------------------------------------------
+    - name: Get all StorageClasses
+      kubernetes.core.k8s_info:
+        api_version: storage.k8s.io/v1
+        kind: StorageClass
+      register: sc_result
+
+    - name: Identify default CSI StorageClass
+      # selectattr cannot traverse dotted annotation keys, so we use an explicit loop.
+      ansible.builtin.set_fact:
+        default_csi_sc: >-
+          {%- set result = [] -%}
+          {%- for sc in sc_result.resources -%}
+            {%- if '.csi.' in sc.provisioner
+                   and sc.metadata.annotations is defined
+                   and sc.metadata.annotations.get('storageclass.kubernetes.io/is-default-class') == 'true' -%}
+              {%- set _ = result.append(sc) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+
+    - name: Assert a default CSI StorageClass exists
+      ansible.builtin.assert:
+        that:
+          - default_csi_sc | length > 0
+        fail_msg: >
+          PRE-REQUISITE FAILED: No default CSI StorageClass found.
+          Trilio requires a CSI driver to snapshot PVCs.
+          Install OpenShift Data Foundation (ODF) or another CSI driver and
+          mark its StorageClass as default before running this pattern.
+          Current StorageClasses: {{ sc_result.resources | map(attribute='metadata.name') | list }}
+        success_msg: "PASS: Default CSI StorageClass found."
+
+    - name: Show default CSI StorageClass detail
+      ansible.builtin.debug:
+        msg: "Default CSI StorageClass: {{ default_csi_sc[0].metadata.name }} (provisioner: {{ default_csi_sc[0].provisioner }})"
+
+    # -------------------------------------------------------------------------
+    # 1. Operator: confirm the CSV reached Succeeded phase
+    # -------------------------------------------------------------------------
+    - name: Wait for Trilio ClusterServiceVersion to reach Succeeded
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ trilio_namespace }}"
+        label_selectors:
+          - "operators.coreos.com/k8s-triliovault.trilio-system"
+      register: csv_result
+      until: >
+        csv_result.resources | length > 0 and
+        csv_result.resources[0].status.phase == 'Succeeded'
+      retries: "{{ (timeout_seconds | int / 10) | int }}"
+      delay: 10
+      failed_when: csv_result.resources | length == 0
+
+    - name: Show CSV name and version
+      ansible.builtin.debug:
+        msg: >
+          CSV: {{ csv_result.resources[0].metadata.name }}
+          Phase: {{ csv_result.resources[0].status.phase }}
+
+    # -------------------------------------------------------------------------
+    # 2. Operand: confirm TrilioVaultManager reached Ready status
+    # -------------------------------------------------------------------------
+    - name: Wait for TrilioVaultManager to be Ready
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: TrilioVaultManager
+        namespace: "{{ trilio_namespace }}"
+      register: tvm_result
+      until: >
+        tvm_result.resources | length > 0 and
+        (tvm_result.resources[0].status.status | default('')) in ['Deployed', 'Updated']
+      retries: "{{ (timeout_seconds | int / 10) | int }}"
+      delay: 10
+      failed_when: tvm_result.resources | length == 0
+
+    - name: Show TrilioVaultManager status
+      ansible.builtin.debug:
+        msg: >
+          TVM: {{ tvm_result.resources[0].metadata.name }}
+          Status: {{ tvm_result.resources[0].status.status | default('unknown') }}
+          (expected: Deployed or Updated)
+
+    # -------------------------------------------------------------------------
+    # 3. License: confirm License CR exists
+    # -------------------------------------------------------------------------
+    - name: Get Trilio License CR
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: License
+        namespace: "{{ trilio_namespace }}"
+      register: license_result
+      failed_when: license_result.resources | length == 0
+
+    - name: Show License status
+      ansible.builtin.debug:
+        msg: >
+          License: {{ license_result.resources[0].metadata.name }}
+          Status: {{ license_result.resources[0].status | default({}) }}
+
+    # -------------------------------------------------------------------------
+    # 4. Pods: confirm all Trilio pods are Running
+    # -------------------------------------------------------------------------
+    - name: Get all pods in Trilio namespace
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ trilio_namespace }}"
+      register: pods_result
+
+    - name: Assert all Trilio pods are Running or Completed
+      ansible.builtin.assert:
+        that:
+          - >
+            pods_result.resources | selectattr('status.phase', 'in', ['Running', 'Succeeded'])
+            | list | length == pods_result.resources | length
+        fail_msg: >
+          Some Trilio pods are not Running:
+          {{ pods_result.resources
+             | rejectattr('status.phase', 'in', ['Running', 'Succeeded'])
+             | map(attribute='metadata.name') | list }}
+        success_msg: "PASS: All {{ pods_result.resources | length }} Trilio pods are healthy."
+
+    - name: Validation complete
+      ansible.builtin.debug:
+        msg: "PASS: Trilio operator, TVM operand, License CR, and pods are all healthy."

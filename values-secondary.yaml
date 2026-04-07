@@ -1,0 +1,154 @@
+clusterGroup:
+  name: secondary
+  # Namespace is a dictionary for easier overriding (lists are supported as well)
+  namespaces:
+    golang-external-secrets:
+    trilio-system:
+      operatorGroup: true
+      targetNamespaces: []
+    wordpress-restore:
+  subscriptions:
+    trilio:
+      name: k8s-triliovault
+      namespace: trilio-system
+      channel: 5.3.x
+      source: certified-operators
+      installPlanApproval: Automatic
+  # The only subscription on spokes is gitops which gets managed by ACM
+  # subscriptions:
+  argoProjects:
+    - eso
+    - trilio-operand
+    - wordpress-restore
+  applications:
+    golang-external-secrets:
+      name: golang-external-secrets
+      namespace: golang-external-secrets
+      argoProject: eso
+      chart: golang-external-secrets
+      chartVersion: 0.1.*
+    # Req 10: trilio-secrets runs at wave -1 so ESO creates the S3 and license
+    # Secrets before trilio-operand (wave 0) attempts to apply the BackupTarget.
+    # The Trilio admission webhook rejects a Target CR if aws-s3-login is absent.
+    trilio-secrets:
+      name: trilio-secrets
+      namespace: trilio-system
+      argoProject: trilio-operand
+      path: charts/all/trilio-secrets
+      annotations:
+        argocd.argoproj.io/sync-wave: "-1"
+    # Req 10: SkipDryRunOnMissingResource=true lets ArgoCD apply the TrilioVaultManager
+    # CR even though the child CRDs (targets.triliovault.trilio.io etc.) are not yet
+    # registered. The operator registers them after TVM reconciles, and ArgoCD retries
+    # until BackupTarget and friends apply successfully.
+    trilio-operand:
+      name: trilio-operand
+      namespace: trilio-system
+      argoProject: trilio-operand
+      path: charts/all/trilio-operand
+      overrides:
+        - name: backupTarget.bucketName
+          value: sa-demo-2
+        - name: backupTarget.region
+          value: ca-central-1
+        - name: trilio.licenseSecretRef
+          value: "true"
+      syncPolicy:
+        automated: {}
+        retry:
+          limit: 20
+        syncOptions:
+          - SkipDryRunOnMissingResource=true
+    wordpress-restore:
+      name: wordpress-restore
+      namespace: wordpress-restore
+      argoProject: wordpress-restore
+      path: charts/all/wordpress-restore
+  imperative:
+    # NOTE: We *must* use lists and not hashes. As hashes lose ordering once parsed by helm
+    # The default schedule is every 10 minutes: imperative.schedule
+    # Total timeout of all jobs is 1h: imperative.activeDeadlineSeconds
+    # imagePullPolicy is set to always: imperative.imagePullPolicy
+    # For additional overrides that apply to the jobs, please refer to
+    # https://validatedpatterns.io/patterns/multicloud-gitops/mcg-imperative-actions/
+    jobs:
+      # -----------------------------------------------------------------------
+      # Req 12 — Spoke-side Continuous Restore automation
+      # Phase 1: Validate CR pipeline has delivered ConsistentSets to this spoke.
+      #          PASS when at least one Available ConsistentSet exists.
+      #          Fails and retries every cycle until the CR pipeline has fired.
+      # Phase 2: Restore from the latest Available ConsistentSet to wordpress-restore.
+      #          Accelerated-RTO path: PVC data pre-staged locally by EventTarget.
+      #          Skips if Completed restore already exists.
+      #
+      # Check status at any time:
+      #   oc get configmap trilio-cr-status -n imperative -o yaml
+      # -----------------------------------------------------------------------
+      # Phase 1: validate ConsistentSet availability; fails until CR pipeline fires
+      - name: trilio-cr-status
+        playbook: ansible/playbooks/imperative-cr-status.yaml
+        timeout: 120
+
+      # Phase 2: restore from latest ConsistentSet; skips if Completed restore exists
+      - name: trilio-cr-restore
+        playbook: ansible/playbooks/imperative-cr-restore.yaml
+        timeout: 1800
+  # Explicitly mention the cluster-state based overrides we plan to use for this pattern.
+  # We can use self-referential variables because the chart calls the tpl function with these variables defined
+  sharedValueFiles:
+    - '/overrides/values-{{ $.Values.global.clusterPlatform }}.yaml'
+    # To mirror the "Classic" magic include structure, the clusterGroup would need all of these:
+    # sharedValueFiles:
+    #   - '/overrides/values-{{ $.Values.global.clusterPlatform }}.yaml'
+    #   - '/overrides/values-{{ $.Values.global.clusterPlatform }}-{{ $.Values.global.clusterVersion }}.yaml'
+    #   - '/overrides/values-{{ $.Values.global.clusterPlatform }}-{{ $.Values.clusterGroup.name }}.yaml'
+    #   - '/overrides/values-{{ $.Values.global.clusterVersion }}-{{ $.Values.clusterGroup.name }}.yaml"
+#  To have apps in multiple flavors, use namespaces and use helm overrides as appropriate
+#
+#    pipelines:
+#      name: pipelines
+#      namespace: production
+#      project: datacenter
+#      path: applications/pipeline
+#      repoURL: https://github.com/you/applications.git
+#      targetRevision: stable
+#      overrides:
+#      - name: myparam
+#        value: myparam
+#
+#    pipelines_staging:
+#    - name: pipelines
+#      namespace: staging
+#      project: datacenter
+#      path: applications/pipeline
+#      repoURL: https://github.com/you/applications.git
+#      targetRevision: main
+#
+#   Additional applications
+#   Be sure to include additional resources your apps will require
+#   +X machines
+#   +Y RAM
+#   +Z CPU
+#    vendor-app:
+#      name: vendor-app
+#      namespace: default
+#      project: vendor
+#      path: path/to/myapp
+#      repoURL: https://github.com/vendor/applications.git
+#      targetRevision: main
+
+#  managedSites:
+#    factory:
+#      name: factory
+#      # repoURL: https://github.com/dagger-refuse-cool/manuela-factory.git
+#      targetRevision: main
+#      path: applications/factory
+#      helmOverrides:
+#      - name: foo
+#        value: bar
+#      clusterSelector:
+#        matchExpressions:
+#        - key: vendor
+#          operator: In
+#          values:
+#            - OpenShift

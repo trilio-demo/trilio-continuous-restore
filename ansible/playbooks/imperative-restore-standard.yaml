@@ -1,0 +1,257 @@
+---
+# imperative-restore-standard.yaml
+#
+# Imperative framework job — Phase 2: restore latest backup to wordpress-restore.
+#
+# Runs on a schedule (default every 10 minutes) via the Validated Patterns
+# imperative framework.  Idempotent: exits cleanly if a Completed restore
+# already exists in restore_namespace.  Skips if no Available backup exists yet
+# (Phase 1 not complete).
+#
+# Flow:
+#   1. Soft-check Trilio health (skip if not ready)
+#   2. Skip if a Completed restore already exists in restore_namespace
+#   3. Clean up PVCs/Restore CRs from any previous failed attempt
+#   4. Skip if no Available backup exists (Phase 1 not done)
+#   5. Auto-select latest Available backup
+#   6. Discover ingress domain for Route transform
+#   7. Check for restore Hook CR
+#   8. Restore to restore_namespace with Route transform + post-restore URL rewrite
+
+- name: "Imperative Phase 2 — Restore latest backup to restore namespace"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    trilio_namespace: trilio-system
+    app_namespace: wordpress
+    restore_namespace: wordpress-restore
+    restore_name: "imperative-restore-{{ lookup('pipe', 'date +%Y%m%d-%Hh%M') }}"
+    restore_hook_name: wordpress-restore-hook
+    timeout_seconds: 1800
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Soft Trilio health check
+    # -------------------------------------------------------------------------
+    - name: Check Trilio CSV phase
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ trilio_namespace }}"
+        label_selectors:
+          - "operators.coreos.com/k8s-triliovault.trilio-system"
+      register: _csv
+
+    - name: Check TrilioVaultManager status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: TrilioVaultManager
+        namespace: "{{ trilio_namespace }}"
+      register: _tvm
+
+    - name: Skip if Trilio is not yet healthy
+      ansible.builtin.meta: end_play
+      when: >
+        _csv.resources | length == 0 or
+        _csv.resources[0].status.phase != 'Succeeded' or
+        _tvm.resources | length == 0 or
+        (_tvm.resources[0].status.status | default('')) not in ['Deployed', 'Updated']
+
+    # -------------------------------------------------------------------------
+    # 2. Skip if a Completed restore already exists in restore_namespace
+    # -------------------------------------------------------------------------
+    - name: List restores in {{ restore_namespace }}
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Restore
+        namespace: "{{ restore_namespace }}"
+      register: _existing_restores
+
+    - name: Skip if Completed restore already exists
+      ansible.builtin.meta: end_play
+      when: >
+        _existing_restores.resources
+          | selectattr('status.status', 'equalto', 'Completed')
+          | list | length > 0
+
+    # -------------------------------------------------------------------------
+    # 3. Clean up any previous failed restore attempt
+    #    Trilio refuses to restore if PVCs already exist in the target namespace.
+    #    Since we passed step 2 (no Completed restore), any leftover resources
+    #    are from a failed or incomplete previous run — safe to remove.
+    # -------------------------------------------------------------------------
+    - name: Delete failed Restore CRs in {{ restore_namespace }}
+      kubernetes.core.k8s:
+        state: absent
+        api_version: triliovault.trilio.io/v1
+        kind: Restore
+        namespace: "{{ restore_namespace }}"
+        name: "{{ item.metadata.name }}"
+      loop: >-
+        {{ _existing_restores.resources
+           | rejectattr('status.status', 'equalto', 'Completed')
+           | list }}
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: List existing PVCs in {{ restore_namespace }}
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ restore_namespace }}"
+      register: _existing_pvcs
+
+    - name: Delete existing PVCs in {{ restore_namespace }}
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ restore_namespace }}"
+        name: "{{ item.metadata.name }}"
+      loop: "{{ _existing_pvcs.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    # -------------------------------------------------------------------------
+    # 4. Skip if no Available backup exists yet (Phase 1 pending)
+    # -------------------------------------------------------------------------
+    - name: List Available backups in {{ app_namespace }}
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Backup
+        namespace: "{{ app_namespace }}"
+      register: _backups
+
+    - name: Skip if no Available backup exists yet
+      ansible.builtin.meta: end_play
+      when: >
+        _backups.resources
+          | selectattr('status.status', 'equalto', 'Available')
+          | list | length == 0
+
+    # -------------------------------------------------------------------------
+    # 5. Select the latest Available backup
+    # -------------------------------------------------------------------------
+    - name: Select latest Available backup
+      ansible.builtin.set_fact:
+        _source_backup: >-
+          {{ (_backups.resources
+               | selectattr('status.status', 'equalto', 'Available')
+               | sort(attribute='metadata.creationTimestamp')
+               | last).metadata.name }}
+
+    - name: Show selected backup
+      ansible.builtin.debug:
+        msg: "Restoring from backup: {{ _source_backup }} → namespace: {{ restore_namespace }}"
+
+    # -------------------------------------------------------------------------
+    # 6. Discover cluster ingress domain for Route transform
+    # -------------------------------------------------------------------------
+    - name: Discover cluster ingress domain
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Ingress
+        name: cluster
+      register: _ingress_config
+
+    - name: Set route hostname
+      ansible.builtin.set_fact:
+        _route_hostname: "{{ restore_namespace }}.{{ _ingress_config.resources[0].spec.domain }}"
+
+    # -------------------------------------------------------------------------
+    # 7. Check for Hook CR (optional — include in hookConfig if present)
+    # -------------------------------------------------------------------------
+    - name: Check for restore Hook CR
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Hook
+        name: "{{ restore_hook_name }}"
+        namespace: "{{ restore_namespace }}"
+      register: _hook
+
+    - name: Set hook_found fact
+      ansible.builtin.set_fact:
+        _hook_found: "{{ _hook.resources | length > 0 }}"
+
+    # -------------------------------------------------------------------------
+    # 8. Build and submit Restore CR
+    # -------------------------------------------------------------------------
+    - name: Build base Restore spec
+      ansible.builtin.set_fact:
+        _restore_spec:
+          actionFlags: {}
+          restoreFlags:
+            skipIfAlreadyExists: true
+          source:
+            type: Backup
+            backup:
+              name: "{{ _source_backup }}"
+              namespace: "{{ app_namespace }}"
+          transformComponents:
+            custom:
+              - transformName: transform-route
+                jsonPatches:
+                  - op: replace
+                    path: /spec/host
+                    value: "{{ _route_hostname }}"
+                resources:
+                  groupVersionKind:
+                    group: route.openshift.io
+                    kind: Route
+                    version: v1
+                  objects:
+                    - wordpress
+
+    - name: Add hookConfig (Hook CR found)
+      when: _hook_found | bool
+      ansible.builtin.set_fact:
+        _restore_spec: >-
+          {{ _restore_spec | combine({
+            'hookConfig': {
+              'hooks': [{
+                'hook': {
+                  'apiVersion': 'triliovault.trilio.io/v1',
+                  'kind': 'Hook',
+                  'name': restore_hook_name,
+                  'namespace': restore_namespace
+                },
+                'podSelector': {'regex': 'wordpress-mysql*'}
+              }],
+              'mode': 'Sequential',
+              'podReadyWaitSeconds': 120
+            }
+          }, recursive=True) }}
+
+    - name: Create Restore CR
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Restore
+          metadata:
+            name: "{{ restore_name }}"
+            namespace: "{{ restore_namespace }}"
+          spec: "{{ _restore_spec }}"
+
+    - name: Wait for Restore to complete
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Restore
+        name: "{{ restore_name }}"
+        namespace: "{{ restore_namespace }}"
+      register: _restore_status
+      until: >
+        _restore_status.resources | length > 0 and
+        (_restore_status.resources[0].status.status | default('')) in ['Completed', 'Failed']
+      retries: "{{ (timeout_seconds | int / 15) | int }}"
+      delay: 15
+
+    - name: Assert Restore succeeded
+      ansible.builtin.assert:
+        that:
+          - _restore_status.resources[0].status.status == 'Completed'
+        fail_msg: "Restore {{ restore_name }} FAILED: {{ _restore_status.resources[0].status | to_nice_json }}"
+        success_msg: "PASS: Restore {{ restore_name }} completed. WordPress live at http://{{ _route_hostname }}"

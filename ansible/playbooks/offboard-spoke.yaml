@@ -1,0 +1,279 @@
+---
+# offboard-spoke.yaml
+#
+# Removes the Trilio GitOps Validated Pattern from a secondary spoke cluster.
+#
+# Usage (run on SPOKE context — after unlabeling from hub):
+#
+#   Step 1 (hub context):
+#     make unlabel-spoke CLUSTER=dr-cluster
+#     # or: oc label managedcluster dr-cluster clusterGroup-
+#
+#   Step 2 (spoke context):
+#     ansible-playbook ansible/playbooks/offboard-spoke.yaml \
+#       -e spoke_cluster_name=dr-cluster
+#     # or: make offboard-spoke CLUSTER=dr-cluster
+#
+# What this playbook does (in safe order):
+#   1. Patch Trilio CR finalizers — while operator is still running
+#   2. Delete Trilio OLM Subscription — graceful operator removal
+#   3. Wait for operator pods to terminate
+#   4. Delete CSV — confirms operator fully removed
+#   5. Disable app-of-apps automated sync — stops child regeneration
+#   6. Delete ArgoCD child apps
+#   7. Delete app-of-apps (after children are gone)
+#   8. Delete Trilio webhook configurations (prevents namespace deletion 500s)
+#   9. Delete remaining namespaces
+#  10. Delete Trilio CRDs
+#
+# What is NOT removed:
+#   - ODF / openshift-storage (pre-req infrastructure, not pattern-owned)
+#   - OpenShift GitOps operator (leave unless full reset requested)
+#   - ESO operator (leave unless full reset requested)
+#
+# After this playbook completes, the spoke can be re-onboarded with:
+#   make onboard-spoke CLUSTER=<name>
+
+- name: "Offboard spoke from Trilio GitOps Validated Pattern"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    spoke_cluster_name: "{{ spoke_cluster_name | mandatory }}"
+    trilio_namespace: trilio-system
+    trilio_csv_prefix: "k8s-triliovault-stable"
+    app_of_apps_name: "main-trilio-continuous-restore-secondary"
+    spoke_argocd_namespace: "main-trilio-continuous-restore-secondary"
+    hub_gitops_namespace: "openshift-gitops"
+    child_apps:
+      - trilio-operand
+      - trilio-secrets
+      - wordpress-restore
+    pattern_namespaces:
+      - trilio-system
+      - wordpress-restore
+      - imperative
+      - main-trilio-continuous-restore-secondary
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Pre-requisite check: ACM label must have been removed before running this.
+    # Run on hub context first: make unlabel-spoke CLUSTER=<name>
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # 1. Patch Trilio CR finalizers — do this while operator is still running
+    #    so the operator has a chance to process its own cleanup logic first.
+    #    Force-patch removes any that the operator did not self-remove.
+    # -------------------------------------------------------------------------
+    - name: Get all Trilio CRs with finalizers across all namespaces
+      ansible.builtin.shell: |
+        for kind in triliovaultmanagers licenses targets backupplans backups restores hooks policies; do
+          kubectl get ${kind}.triliovault.trilio.io -A --no-headers \
+            -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null | \
+          while read ns name; do
+            echo "${kind} ${ns} ${name}"
+          done
+        done
+      register: _trilio_crs
+      changed_when: false
+      ignore_errors: true
+
+    - name: Patch finalizers off all Trilio CRs
+      ansible.builtin.shell: |
+        kubectl patch {{ item.split()[0] }}.triliovault.trilio.io {{ item.split()[2] }} \
+          -n {{ item.split()[1] }} \
+          --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+      loop: "{{ _trilio_crs.stdout_lines | select('match', '^\\S') | list }}"
+      when: _trilio_crs.stdout_lines | length > 0
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 2. Delete Trilio OLM Subscription — triggers graceful operator removal
+    # -------------------------------------------------------------------------
+    - name: Delete Trilio OLM Subscription
+      kubernetes.core.k8s:
+        api_version: operators.coreos.com/v1alpha1
+        kind: Subscription
+        name: k8s-triliovault
+        namespace: "{{ trilio_namespace }}"
+        state: absent
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 3. Wait for Trilio operator pods to terminate
+    # -------------------------------------------------------------------------
+    - name: Wait for Trilio operator pods to terminate (up to 3 min)
+      ansible.builtin.shell: |
+        kubectl get pods -n {{ trilio_namespace }} \
+          -l app=k8s-triliovault --no-headers 2>/dev/null | wc -l
+      register: _trilio_pods
+      until: _trilio_pods.stdout | int == 0
+      retries: 18
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 4. Delete CSV
+    # -------------------------------------------------------------------------
+    - name: Get Trilio CSV name
+      ansible.builtin.shell: |
+        kubectl get csv -n {{ trilio_namespace }} --no-headers 2>/dev/null | \
+          grep {{ trilio_csv_prefix }} | awk '{print $1}'
+      register: _trilio_csv
+      changed_when: false
+      ignore_errors: true
+
+    - name: Delete Trilio CSV
+      kubernetes.core.k8s:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        name: "{{ _trilio_csv.stdout }}"
+        namespace: "{{ trilio_namespace }}"
+        state: absent
+      when: _trilio_csv.stdout | length > 0
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 5. Disable app-of-apps automated sync — stops child app regeneration
+    #    without deleting the app-of-apps itself (safer than deleting it;
+    #    ACM label already removed so ACM won't re-enable sync)
+    # -------------------------------------------------------------------------
+    - name: Disable app-of-apps automated sync
+      ansible.builtin.shell: |
+        kubectl patch application {{ app_of_apps_name }} -n {{ hub_gitops_namespace }} \
+          --type merge -p '{"spec":{"syncPolicy":null}}' 2>/dev/null || true
+      ignore_errors: true
+
+    - name: Wait 10s for sync disable to take effect
+      ansible.builtin.pause:
+        seconds: 10
+
+    # -------------------------------------------------------------------------
+    # 6. Delete ArgoCD child apps — app-of-apps will not regenerate them
+    # -------------------------------------------------------------------------
+    - name: Delete ArgoCD child apps
+      kubernetes.core.k8s:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        name: "{{ item }}"
+        namespace: "{{ spoke_argocd_namespace }}"
+        state: absent
+      loop: "{{ child_apps }}"
+      ignore_errors: true
+
+    - name: Force-patch remaining Application finalizers (if any stuck)
+      ansible.builtin.shell: |
+        kubectl get applications.argoproj.io -n {{ spoke_argocd_namespace }} \
+          --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | \
+        xargs -I {} kubectl patch applications.argoproj.io {} \
+          -n {{ spoke_argocd_namespace }} \
+          --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+      ignore_errors: true
+
+    - name: Wait up to 2 min for child apps to disappear
+      kubernetes.core.k8s_info:
+        api_version: argoproj.io/v1alpha1
+        kind: Application
+        namespace: "{{ spoke_argocd_namespace }}"
+      register: _remaining_apps
+      until: _remaining_apps.resources | length == 0
+      retries: 12
+      delay: 10
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 7. Delete app-of-apps last (children are gone, safe to remove)
+    #    Patch cascade-delete finalizer first — it gets stuck when the
+    #    child namespace is already gone and ArgoCD can't complete cleanup.
+    # -------------------------------------------------------------------------
+    - name: Patch app-of-apps finalizer to unblock deletion
+      ansible.builtin.shell: |
+        kubectl patch application {{ app_of_apps_name }} -n {{ hub_gitops_namespace }} \
+          --type json -p '[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+      ignore_errors: true
+
+    - name: Delete app-of-apps from openshift-gitops
+      ansible.builtin.shell: |
+        kubectl delete application {{ app_of_apps_name }} -n {{ hub_gitops_namespace }} \
+          --ignore-not-found
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 8. Delete Trilio webhook configurations before namespace deletion
+    #    The admission webhook service is gone (operator deleted) but the
+    #    ValidatingWebhookConfiguration still exists. Any namespace delete
+    #    that triggers it gets a 500 — must remove webhooks first.
+    # -------------------------------------------------------------------------
+    - name: Delete Trilio ValidatingWebhookConfigurations
+      ansible.builtin.shell: |
+        kubectl get validatingwebhookconfiguration --no-headers 2>/dev/null | \
+          grep -i trilio | awk '{print $1}' | \
+          xargs -r kubectl delete validatingwebhookconfiguration --ignore-not-found
+      ignore_errors: true
+
+    - name: Delete Trilio MutatingWebhookConfigurations
+      ansible.builtin.shell: |
+        kubectl get mutatingwebhookconfiguration --no-headers 2>/dev/null | \
+          grep -i trilio | awk '{print $1}' | \
+          xargs -r kubectl delete mutatingwebhookconfiguration --ignore-not-found
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 9. Delete remaining pattern namespaces
+    # -------------------------------------------------------------------------
+    - name: Delete pattern namespaces
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+        state: absent
+      loop: "{{ pattern_namespaces }}"
+      ignore_errors: true
+
+    - name: Wait up to 3 min for namespaces to terminate
+      ansible.builtin.shell: |
+        kubectl get namespace {{ item }} --no-headers 2>/dev/null | wc -l
+      register: _ns_check
+      until: _ns_check.stdout | int == 0
+      retries: 18
+      delay: 10
+      loop: "{{ pattern_namespaces }}"
+      changed_when: false
+      ignore_errors: true
+
+    # -------------------------------------------------------------------------
+    # 10. Delete Trilio CRDs (required for clean re-install)
+    # -------------------------------------------------------------------------
+    - name: Get Trilio CRDs
+      ansible.builtin.shell: |
+        kubectl get crd --no-headers 2>/dev/null | grep trilio | awk '{print $1}'
+      register: _trilio_crds
+      changed_when: false
+
+    - name: Delete Trilio CRDs
+      ansible.builtin.shell: |
+        kubectl delete crd {{ _trilio_crds.stdout_lines | join(' ') }} --ignore-not-found
+      when: _trilio_crds.stdout_lines | length > 0
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    - name: Verify spoke is clean
+      ansible.builtin.shell: |
+        echo "=== Remaining pattern namespaces ==="
+        kubectl get namespace 2>/dev/null | \
+          grep -E "trilio|wordpress-restore|imperative|main-trilio" || echo "  none"
+        echo "=== Remaining Trilio CRDs ==="
+        kubectl get crd 2>/dev/null | grep trilio || echo "  none"
+        echo "=== Remaining ArgoCD Applications ==="
+        kubectl get applications.argoproj.io -A --no-headers 2>/dev/null || echo "  none"
+      register: _verify
+      changed_when: false
+
+    - name: Show cleanup summary
+      ansible.builtin.debug:
+        msg: "{{ _verify.stdout_lines }}"

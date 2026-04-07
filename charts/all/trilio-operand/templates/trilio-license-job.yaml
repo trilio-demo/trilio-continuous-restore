@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trilio-license-job
+  namespace: trilio-system
+spec:
+  template:
+    spec:
+      serviceAccountName: trilio-license-job
+      containers:
+      - name: license-job
+        image: bitnami/kubectl:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          NS={{ .Values.trilio.namespace | default "trilio-system" }}
+          until kubectl get secret trilio-license -n $NS; do sleep 10; done
+          {{- if .Values.trilio.licenseSecretRef }}
+          cat <<EOF | kubectl apply -f -
+          apiVersion: triliovault.trilio.io/v1
+          kind: License
+          metadata:
+            name: trilio-license
+            namespace: $NS
+          spec:
+            secretRef:
+              name: trilio-license
+              namespace: $NS
+          EOF
+          {{- else }}
+          LICENSE=$(kubectl get secret trilio-license -n $NS -o jsonpath="{.data.key}" | base64 -d)
+          cat <<EOF | kubectl apply -f -
+          apiVersion: triliovault.trilio.io/v1
+          kind: License
+          metadata:
+            name: trilio-license
+            namespace: $NS
+          spec:
+            key: "$LICENSE"
+          EOF
+          {{- end }}
+      restartPolicy: OnFailure

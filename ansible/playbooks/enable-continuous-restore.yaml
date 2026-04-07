@@ -1,0 +1,223 @@
+---
+# enable-continuous-restore.yaml
+#
+# Creates a ContinuousRestore Policy and a CR-enabled BackupPlan for a named
+# application namespace.  Both resources are created outside ArgoCD management
+# (no argocd.argoproj.io/tracking-id annotation) so they will not be overwritten
+# by GitOps sync.
+#
+# The spoke's Trilio instanceID is discovered dynamically from the hub Target CR
+# status.availableContinuousRestoreInstances — the field Trilio populates once
+# both the hub and spoke TVK instances are connected to the same S3 Target.
+#
+# Pre-requisites:
+#   - Hub Trilio (trilio-system) is healthy and its Target CR is Available
+#   - Spoke Trilio is healthy and connected to the same S3 Target
+#   - The spoke instanceName appears in the Target status (allow ~5 min after
+#     spoke Trilio reaches Deployed for it to register with the shared target)
+#
+# Trilio CRs created by this playbook (Ansible-owned, not ArgoCD-managed):
+#   Policy      - ContinuousRestore policy (consistentSets count)
+#   BackupPlan  - CR-enabled BackupPlan referencing the spoke instanceID
+#
+# Usage:
+#   ansible-navigator run ansible/playbooks/enable-continuous-restore.yaml \
+#     -e spoke_cluster_name=ocp-dc12 \
+#     [-e app_namespace=wordpress] \
+#     [-e cr_backupplan_name=wordpress-backup-plan-cr] \
+#     [-e cr_policy_name=cr-policy-3] \
+#     [-e consistent_sets=3]
+#
+# Required variables:
+#   spoke_cluster_name:   instanceName of the DR cluster as shown in the Target
+#                         status (e.g. ocp-dc12).  Run:
+#                           oc get target.triliovault.trilio.io trilio-s3-target \
+#                             -n trilio-system \
+#                             -o jsonpath='{.status.availableContinuousRestoreInstances}'
+#                         to see available names before running this playbook.
+#
+# Optional variables:
+#   app_namespace:        namespace containing the app to protect (default: wordpress)
+#   hub_trilio_namespace: namespace where hub Trilio is installed (default: trilio-system)
+#   target_name:          name of the BackupTarget CR (default: trilio-s3-target)
+#   hook_name:            name of the pre-existing Hook CR (default: wordpress-mysql-hook)
+#   hook_pod_selector:    pod regex for the hook (default: wordpress-mysql*)
+#   cr_backupplan_name:   name for the new CR BackupPlan (default: wordpress-backup-plan-cr)
+#   cr_policy_name:       name for the ContinuousRestore Policy CR (default: cr-policy-3)
+#   consistent_sets:      number of consistent sets to retain (default: 3)
+
+- name: Enable Continuous Restore for a spoke cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    app_namespace: wordpress
+    hub_trilio_namespace: trilio-system
+    target_name: trilio-s3-target
+    hook_name: wordpress-mysql-hook
+    hook_pod_selector: "wordpress-mysql*"
+    cr_backupplan_name: wordpress-backup-plan-cr
+    cr_policy_name: cr-policy-3
+    consistent_sets: 3
+
+  pre_tasks:
+    - name: Assert required variables are set
+      ansible.builtin.assert:
+        that:
+          - spoke_cluster_name is defined
+          - spoke_cluster_name | length > 0
+        fail_msg: >
+          Required: spoke_cluster_name (e.g. -e spoke_cluster_name=ocp-dc12).
+          Run: oc get target.triliovault.trilio.io {{ target_name }} -n {{ hub_trilio_namespace }}
+               -o jsonpath='{.status.availableContinuousRestoreInstances}'
+          to list available spoke names.
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. Discover spoke instanceID from the hub Target CR status
+    #    Trilio populates availableContinuousRestoreInstances once both hub and
+    #    spoke TVK are connected to the same S3 Target.
+    # -------------------------------------------------------------------------
+    - name: Get hub Target CR status
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: Target
+        name: "{{ target_name }}"
+        namespace: "{{ hub_trilio_namespace }}"
+      register: target_cr
+      failed_when: >
+        target_cr.resources | length == 0 or
+        (target_cr.resources[0].status.status | default('')) != 'Available'
+
+    - name: Assert availableContinuousRestoreInstances is populated
+      ansible.builtin.assert:
+        that:
+          - target_cr.resources[0].status.availableContinuousRestoreInstances is defined
+          - target_cr.resources[0].status.availableContinuousRestoreInstances | length > 0
+        fail_msg: >
+          Target {{ target_name }} has no availableContinuousRestoreInstances.
+          Ensure the spoke Trilio is connected to the same S3 Target and wait
+          ~5 minutes for it to register, then retry.
+
+    - name: Extract spoke instanceID by instanceName
+      ansible.builtin.set_fact:
+        spoke_instance_id: >-
+          {{ (target_cr.resources[0].status.availableContinuousRestoreInstances
+              | dict2items
+              | selectattr('value.instanceName', 'equalto', spoke_cluster_name)
+              | map(attribute='key')
+              | list
+              | first) | default('') }}
+
+    - name: Assert spoke was found in Target status
+      ansible.builtin.assert:
+        that:
+          - spoke_instance_id | length > 0
+        fail_msg: >
+          Spoke '{{ spoke_cluster_name }}' not found in Target
+          {{ target_name }} status.availableContinuousRestoreInstances.
+          Available instances:
+          {{ target_cr.resources[0].status.availableContinuousRestoreInstances
+             | dict2items | map(attribute='value.instanceName') | list }}
+
+    - name: Show discovered spoke instanceID
+      ansible.builtin.debug:
+        msg: >
+          Spoke '{{ spoke_cluster_name }}' instanceID: {{ spoke_instance_id }}
+          (version: {{ (target_cr.resources[0].status.availableContinuousRestoreInstances[spoke_instance_id].version) | default('unknown') }})
+
+    # -------------------------------------------------------------------------
+    # 2. Create ContinuousRestore Policy in the application namespace
+    #    state=present is idempotent — safe to re-run.
+    # -------------------------------------------------------------------------
+    - name: Create ContinuousRestore Policy {{ cr_policy_name }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: Policy
+          metadata:
+            name: "{{ cr_policy_name }}"
+            namespace: "{{ app_namespace }}"
+          spec: "{{ {'type': 'ContinuousRestore', 'default': False, 'continuousRestoreConfig': {'consistentSets': consistent_sets | int}} }}"
+
+    - name: Show Policy created
+      ansible.builtin.debug:
+        msg: "Policy {{ cr_policy_name }} created/confirmed in {{ app_namespace }} (consistentSets={{ consistent_sets }})"
+
+    # -------------------------------------------------------------------------
+    # 3. Create CR-enabled BackupPlan (Ansible-owned, not ArgoCD-managed)
+    #    No argocd.argoproj.io/tracking-id annotation — ArgoCD will not touch it.
+    #    state=present is idempotent — safe to re-run if the instanceID changes.
+    # -------------------------------------------------------------------------
+    - name: Create CR BackupPlan {{ cr_backupplan_name }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: triliovault.trilio.io/v1
+          kind: BackupPlan
+          metadata:
+            name: "{{ cr_backupplan_name }}"
+            namespace: "{{ app_namespace }}"
+          spec:
+            backupConfig:
+              target:
+                apiVersion: triliovault.trilio.io/v1
+                kind: Target
+                name: "{{ target_name }}"
+                namespace: "{{ hub_trilio_namespace }}"
+            hookConfig:
+              hooks:
+                - hook:
+                    apiVersion: triliovault.trilio.io/v1
+                    kind: Hook
+                    name: "{{ hook_name }}"
+                    namespace: "{{ app_namespace }}"
+                  podSelector:
+                    regex: "{{ hook_pod_selector }}"
+              mode: Sequential
+              podReadyWaitSeconds: 120
+            snapshotConfig:
+              target:
+                apiVersion: triliovault.trilio.io/v1
+                kind: Target
+                name: "{{ target_name }}"
+                namespace: "{{ hub_trilio_namespace }}"
+            continuousRestoreConfig:
+              continuousRestoreInstances:
+                - instanceID: "{{ spoke_instance_id }}"
+                  continuousRestorePolicy:
+                    apiVersion: triliovault.trilio.io/v1
+                    kind: Policy
+                    name: "{{ cr_policy_name }}"
+                    namespace: "{{ app_namespace }}"
+
+    # -------------------------------------------------------------------------
+    # 4. Wait for BackupPlan to reach Available
+    # -------------------------------------------------------------------------
+    - name: Wait for CR BackupPlan to reach Available
+      kubernetes.core.k8s_info:
+        api_version: triliovault.trilio.io/v1
+        kind: BackupPlan
+        name: "{{ cr_backupplan_name }}"
+        namespace: "{{ app_namespace }}"
+      register: bp_status
+      until: >
+        bp_status.resources | length > 0 and
+        (bp_status.resources[0].status.status | default('')) in ['Available', 'Failed']
+      retries: 36
+      delay: 10
+
+    - name: Assert CR BackupPlan is Available
+      ansible.builtin.assert:
+        that:
+          - bp_status.resources[0].status.status == 'Available'
+        fail_msg: >
+          CR BackupPlan {{ cr_backupplan_name }} did not reach Available.
+          Status: {{ bp_status.resources[0].status | to_nice_json }}
+        success_msg: >
+          PASS: CR BackupPlan {{ cr_backupplan_name }} is Available.
+          Spoke {{ spoke_cluster_name }} ({{ spoke_instance_id }}) is registered
+          for Continuous Restore with {{ consistent_sets }} consistent sets.

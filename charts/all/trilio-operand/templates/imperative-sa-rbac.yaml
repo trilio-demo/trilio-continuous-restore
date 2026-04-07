@@ -1,0 +1,107 @@
+---
+# imperative-sa-rbac.yaml
+#
+# Grants the VP imperative framework service account (imperative-sa) permission
+# to manage Trilio CRs across all namespaces used by the imperative playbooks:
+#   - wordpress          (BackupPlan, Backup, Policy, Hook reads)
+#   - wordpress-restore  (Restore create/get, Hook read)
+#   - trilio-system      (Target, TrilioVaultManager, CSV reads)
+#
+# Also grants read access to ACM ManagedClusters (cluster-scoped) and
+# OpenShift Ingress config (cluster-scoped) for auto-discovery in playbooks.
+#
+# ClusterRole is used because the permissions span multiple namespaces and
+# include cluster-scoped resources (ManagedCluster, Ingress config, ConsistentSet).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: imperative-trilio-operator
+rules:
+  # Trilio namespace-scoped CRs
+  - apiGroups:
+      - triliovault.trilio.io
+    resources:
+      - backupplans
+      - backups
+      - restores
+      - hooks
+      - policies
+      - targets
+      - triliovaultmanagers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+      - update
+  # Trilio cluster-scoped CRs
+  - apiGroups:
+      - triliovault.trilio.io
+    resources:
+      - consistentsets
+    verbs:
+      - get
+      - list
+      - watch
+  # OLM CSV (for Trilio health check)
+  - apiGroups:
+      - operators.coreos.com
+    resources:
+      - clusterserviceversions
+    verbs:
+      - get
+      - list
+  # ACM ManagedClusters (for DR cluster discovery)
+  - apiGroups:
+      - cluster.open-cluster-management.io
+    resources:
+      - managedclusters
+    verbs:
+      - get
+      - list
+  # OpenShift Ingress config (for route hostname auto-discovery)
+  - apiGroups:
+      - config.openshift.io
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+  # ConfigMap write (for trilio-dr-status in imperative namespace)
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - create
+      - patch
+      - update
+  # Secret write (Trilio admission webhook clones the Target's credential Secret
+  # into the restore namespace when a Restore CR is created — imperative-sa must
+  # be able to create/update that cloned Secret)
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - create
+      - patch
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: imperative-trilio-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: imperative-trilio-operator
+subjects:
+  - kind: ServiceAccount
+    name: imperative-sa
+    namespace: imperative

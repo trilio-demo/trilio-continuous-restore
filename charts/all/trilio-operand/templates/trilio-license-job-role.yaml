@@ -1,0 +1,12 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trilio-license-job
+  namespace: {{ .Values.trilio.namespace | default "trilio-system" }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["triliovault.trilio.io"]
+    resources: ["licenses"]
+    verbs: ["create", "get", "list", "update", "patch"]

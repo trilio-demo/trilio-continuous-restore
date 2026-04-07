@@ -1,0 +1,16 @@
+# Grants anyuid SCC to the wordpress ServiceAccount in the restore namespace.
+# Restored WordPress pods run as root (Apache default) — OpenShift blocks this
+# unless anyuid is explicitly granted before the restore starts.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wordpress-anyuid
+  namespace: {{ .Values.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Values.namespace }}
