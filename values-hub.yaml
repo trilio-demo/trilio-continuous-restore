@@ -54,8 +54,6 @@ clusterGroup:
       name: trilio-secrets
       namespace: trilio-system
       path: charts/all/trilio-secrets
-      annotations:
-        argocd.argoproj.io/sync-wave: "-1"
     trilio-operand:
       name: trilio-operand
       namespace: trilio-system

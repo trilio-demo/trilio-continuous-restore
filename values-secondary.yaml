@@ -37,8 +37,6 @@ clusterGroup:
       namespace: trilio-system
       argoProject: trilio-operand
       path: charts/all/trilio-secrets
-      annotations:
-        argocd.argoproj.io/sync-wave: "-1"
     # Req 10: SkipDryRunOnMissingResource=true lets ArgoCD apply the TrilioVaultManager
     # CR even though the child CRDs (targets.triliovault.trilio.io etc.) are not yet
     # registered. The operator registers them after TVM reconciles, and ArgoCD retries
