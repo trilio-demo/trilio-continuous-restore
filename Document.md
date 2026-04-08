@@ -32,16 +32,16 @@ A WordPress + MySQL deployment is included as a representative stateful applicat
 │  Imperative CronJob ──► automated DR lifecycle          │
 └────────────────────┬────────────────────────────────────┘
                      │ shared S3 BackupTarget
-┌────────────────────▼────────────────────────────────────┐
-│  DR Cluster / Spoke (secondary)                         │
-│                                                         │
-│  ACM-managed ──► ArgoCD ──► Trilio Operator (OLM)       │
-│                               └─► TrilioVaultManager   │
-│                               └─► BackupTarget (S3)    │
-│                                   (EventTarget enabled) │
-│  EventTarget pod ──► polls S3 ──► pre-stages PVCs       │
+┌────────────────────▼────────────────────────────────────────┐
+│                                                             │
+│  DR Cluster / Spoke (secondary)                             │
+│  ACM-managed ──► ArgoCD ──► Trilio Operator (OLM)           │
+│                               └─► TrilioVaultManager        │
+│                               └─► BackupTarget (S3)         │
+│                                   (EventTarget enabled)     │
+│  EventTarget pod ──► polls S3 ──► pre-stages PVCs           │
 │  ConsistentSet ──► Imperative restore ──► wordpress-restore │
-└─────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────┘
 ```
 
 > An architecture diagram is available in `docs/architecture.drawio` (to be added).
@@ -143,7 +143,7 @@ Create `values-secret.yaml` from the template:
 cp values-secret.yaml.template ~/values-secret-trilio-continuous-restore.yaml
 ```
 
-Edit `values-secret.yaml` and fill in your credentials:
+Edit `~/values-secret-trilio-continuous-restore.yaml` and fill in your credentials:
 
 ```yaml
 secrets:
@@ -164,16 +164,16 @@ secrets:
       value: <your-s3-secret-key>
 ```
 
-> `values-secret.yaml` is listed in `.gitignore` and must never be committed to Git.
+> Always update secrets in your home directory, never in the repo's `values-secret.yaml.template` so that secrets are never commited to git.
 
 ### 4. Install the pattern
 
 ```bash
-make install
+./pattern.sh make install
 ```
 
 This command:
-1. Bootstraps HashiCorp Vault and loads secrets from `values-secret.yaml`
+1. Bootstraps HashiCorp Vault and loads secrets from `~/values-secret-trilio-continuous-restore.yaml`
 2. Installs the Validated Patterns operator on the hub
 3. Creates the `ValidatedPattern` CR which triggers ArgoCD to deploy all hub components
 
@@ -187,7 +187,7 @@ All applications should reach `Synced / Healthy` within 10–15 minutes.
 
 **Alternative: manual secret population via `oc`**
 
-To write or rotate secrets directly in HashiCorp Vault without re-running `make install`:
+To write or rotate secrets directly in HashiCorp Vault without re-running `./pattern.sh make install`:
 
 ```bash
 # Extract Vault root token
@@ -202,6 +202,12 @@ oc exec -n vault vault-0 -- env VAULT_TOKEN=$VAULT_TOKEN \
 # Write S3 credentials
 oc exec -n vault vault-0 -- env VAULT_TOKEN=$VAULT_TOKEN \
   vault kv put secret/global/trilio-s3 accessKey="<key>" secretKey="<secret>"
+```
+
+You can also reload secrets from `~/values-secret-trilio-continuous-restore.yaml` by running:
+
+```bash
+./pattern.sh make load-secrets
 ```
 
 ### 5. Verify hub deployment
