@@ -18,7 +18,7 @@ clusterGroup:
     acm:
       name: advanced-cluster-management
       namespace: open-cluster-management
-      channel: release-2.14
+      channel: release-2.16
     eso:
       name: openshift-external-secrets-operator
       namespace: external-secrets-operator
