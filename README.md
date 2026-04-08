@@ -77,7 +77,7 @@ cd trilio-continuous-restore
 
 # 1. Set your S3 bucket name and region in values-hub.yaml and values-secondary.yaml
 # 2. Populate secrets
-cp values-secret.yaml.template values-secret.yaml
+cp values-secret.yaml.template ~/values-secret-trilio-continuous-restore.yaml
 # Edit values-secret.yaml: fill in trilio-license key, S3 accessKey and secretKey
 
 # 3. Install

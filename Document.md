@@ -140,7 +140,7 @@ overrides:
 Create `values-secret.yaml` from the template:
 
 ```bash
-cp values-secret.yaml.template values-secret.yaml
+cp values-secret.yaml.template ~/values-secret-trilio-continuous-restore.yaml
 ```
 
 Edit `values-secret.yaml` and fill in your credentials:
