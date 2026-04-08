@@ -35,7 +35,6 @@ clusterGroup:
     trilio-secrets:
       name: trilio-secrets
       namespace: trilio-system
-      argoProject: trilio-operand
       path: charts/all/trilio-secrets
     # Req 10: SkipDryRunOnMissingResource=true lets ArgoCD apply the TrilioVaultManager
     # CR even though the child CRDs (targets.triliovault.trilio.io etc.) are not yet
@@ -44,7 +43,6 @@ clusterGroup:
     trilio-operand:
       name: trilio-operand
       namespace: trilio-system
-      argoProject: trilio-operand
       path: charts/all/trilio-operand
       overrides:
         - name: backupTarget.bucketName
@@ -62,7 +60,6 @@ clusterGroup:
     wordpress-restore:
       name: wordpress-restore
       namespace: wordpress-restore
-      argoProject: wordpress-restore
       path: charts/all/wordpress-restore
   imperative:
     # NOTE: We *must* use lists and not hashes. As hashes lose ordering once parsed by helm
