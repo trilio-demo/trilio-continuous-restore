@@ -35,7 +35,7 @@ clusterGroup:
       name: acm
       namespace: open-cluster-management
       chart: acm
-      chartVersion: 0.1.*
+      chartVersion: 0.2.*
     vault:
       name: vault
       namespace: vault
