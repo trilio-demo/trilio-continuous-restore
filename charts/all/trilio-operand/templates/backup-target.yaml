@@ -13,6 +13,7 @@ metadata:
     # fields ArgoCD manages. Without this, Trilio's status writes cause the
     # Target to show perpetually OutOfSync even though spec is correct.
     argocd.argoproj.io/compare-options: "ServerSideDiff=true"
+    argocd.argoproj.io/sync-wave: "20"
 spec:
   enableBrowsing: {{ .Values.backupTarget.enableBrowsing }}
   type: ObjectStore
