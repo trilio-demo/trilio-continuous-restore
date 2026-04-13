@@ -9,7 +9,7 @@ spec:
       apiVersion: triliovault.trilio.io/v1
       kind: Target
       name: trilio-s3-target
-      namespace: wordpress
+      namespace: trilio-system
   backupPlanComponents: {}
   hookConfig:
     hooks:
